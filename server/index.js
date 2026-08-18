@@ -1,8 +1,6 @@
-// Phase 0 proof of concept server.
-// Responsibilities kept deliberately minimal: serve the static PoC client,
-// answer clock-offset ping/pong, and broadcast a single future scheduled-play
-// event to all connected sockets. Rooms, auth, versioning, drift correction
-// etc. are NOT implemented here yet - they arrive in later phases.
+// Express + Socket.IO server. Serves the Phase 0 PoC client as static files
+// (server/public/*, still fully functional and untouched) alongside the real
+// app's room/track/clock/playback/drift handlers registered below.
 const path = require('path');
 const os = require('os');
 const express = require('express');
@@ -10,6 +8,9 @@ const http = require('http');
 const { Server } = require('socket.io');
 const registerRoomHandlers = require('./roomHandlers');
 const registerTrackHandlers = require('./trackHandlers');
+const registerClockHandlers = require('./clockHandlers');
+const registerPlaybackHandlers = require('./playbackHandlers');
+const registerDriftHandlers = require('./driftHandlers');
 const { createUploadRouter, UPLOAD_DIR } = require('./uploadRoute');
 
 const PORT = process.env.PORT || 3001;
@@ -28,6 +29,9 @@ io.on('connection', (socket) => {
 
   registerRoomHandlers(io, socket);
   registerTrackHandlers(io, socket);
+  registerClockHandlers(io, socket);
+  registerPlaybackHandlers(io, socket);
+  registerDriftHandlers(io, socket);
 
   // Single-sample Cristian's-algorithm style clock offset probe.
   // Phase 3 replaces this with an 8-10 sample, low-RTT/median robust estimate.

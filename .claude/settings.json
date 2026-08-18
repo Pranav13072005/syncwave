@@ -55,7 +55,20 @@
       "Bash(curl -s -m 5 -o /dev/null -w \"Room.jsx: HTTP %{http_code}\\\\n\" http://localhost:5173/src/components/Room.jsx)",
       "Bash(curl -s -m 5 -o /dev/null -w \"TrackPanel.jsx: HTTP %{http_code}\\\\n\" http://localhost:5173/src/components/TrackPanel.jsx)",
       "Bash(curl -s -m 5 -o /dev/null -w \"api proxy: HTTP %{http_code}\\\\n\" -X POST http://localhost:5173/api/upload)",
-      "Bash(curl -s -m 5 -o /dev/null -w \"uploads proxy \\(404 expected, proves proxy works\\): HTTP %{http_code}\\\\n\" http://localhost:5173/uploads/doesnotexist.wav)"
+      "Bash(curl -s -m 5 -o /dev/null -w \"uploads proxy \\(404 expected, proves proxy works\\): HTTP %{http_code}\\\\n\" http://localhost:5173/uploads/doesnotexist.wav)",
+      "Bash(node -e \"require\\('./roomManager'\\); require\\('./clockHandlers'\\); require\\('./index.js'\\);\")",
+      "Bash(wait)",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''node.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*server*index.js*'\\\\'' } | Select-Object ProcessId,CommandLine')",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''node.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*index.js*'\\\\'' } | Select-Object ProcessId,CommandLine')",
+      "Bash(node _phase3_smoketest.mjs)",
+      "Bash(node _phase3_report_test.mjs)",
+      "Bash(npm test *)",
+      "Bash(curl -s -m 5 -o /dev/null -w \"Diagnostics.jsx: HTTP %{http_code}\\\\n\" http://localhost:5173/src/components/Diagnostics.jsx)",
+      "Bash(curl -s -m 5 -o /dev/null -w \"clockSync.js: HTTP %{http_code}\\\\n\" http://localhost:5173/src/clockSync.js)",
+      "Bash(mkdir -p \"/c/Users/prana/OneDrive/Desktop/syncwave/server/test\")",
+      "Bash(node --test test/roomManager.playback.test.js)",
+      "Bash(node --test test/playback.integration.test.js)",
+      "Bash(node --test test/playbackEngine.unit.test.mjs)"
     ],
     "additionalDirectories": [
       "c:\\Users\\prana\\OneDrive\\Desktop\\syncwave\\server\\public",

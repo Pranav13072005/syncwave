@@ -21,8 +21,8 @@ function registerTrackHandlers(io, socket) {
     ack?.({ ok: true, token });
   });
 
-  socket.on('track:ready', ({ version } = {}, ack) => {
-    const room = roomManager.setReady(socket.id, version);
+  socket.on('track:ready', ({ version, durationSec } = {}, ack) => {
+    const room = roomManager.setReady(socket.id, version, durationSec);
     if (!room) {
       ack?.({ ok: false });
       return;

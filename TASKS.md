@@ -19,20 +19,59 @@
   a 17-point scripted Socket.IO + HTTP smoke test (host-only token issuance,
   bad file type/token rejection, upload success + broadcast, byte-identical
   download, stale-ready rejection, ready broadcast, replace-track version
-  bump + ready-state clear + old-file cleanup). Web Audio decode itself
-  requires a real browser — not yet manually verified by the devs.
+  bump + ready-state clear + old-file cleanup). Manually verified in-browser
+  by the devs — confirmed working (including a real upload left in
+  `server/uploads/`).
+- Phase 3: Robust 9-sample clock-offset estimation (`client/src/clockSync.js`),
+  reusing the existing `clock:ping` primitive; lowest-RTT-half + median
+  filtering; graceful timeout/failure handling; `Diagnostics` panel (status,
+  RTT, offset, sample count, manual re-sync) triggered on room join and on
+  Socket.IO reconnect; server-side per-client RTT/offset/status storage
+  (`server/clockHandlers.js`) broadcast via `room:update`, surfaced as a
+  compact RTT readout in the device list. Permanent scripted test suite
+  added at `client/test/` (`node --test`, no new dependency): 4 unit tests
+  on the pure filtering/median math, 4 integration tests against the live
+  server — all 8 passing. Manually verified in-browser by the devs.
+- Phase 4: Authoritative per-room playback state (`server/roomManager.js`:
+  `status`, `positionSec`, `anchorServerTime`, `version`, `trackVersion`);
+  host-only `playback:play`/`pause`/`seek` (`server/playbackHandlers.js`)
+  with future-scheduled `anchorServerTime`, server-side host/track/seek-range
+  validation; canonical position correctly maintained for both playing
+  (extrapolated) and paused (frozen) states; monotonic version bumped by
+  every command and by track replacement; client `playbackEngine.js`
+  converts server time to local `AudioContext` scheduling via the Phase 3
+  offset, one fresh `AudioBufferSourceNode` per play/seek, synchronized
+  stop-old/start-new at the same instant; `PlaybackControls` UI; a pending
+  (not dropped) command is retried once this device's decode catches up -
+  covers both late join and a host clicking Play before their own decode
+  finishes. New `server/test/` suite (`node --test`, `socket.io-client`
+  devDependency): 14 unit + 5 integration tests. Client: 4 new unit tests.
+  Total 24 new scripted tests (31 across the project). Manually verified
+  in-browser by the devs.
+- Phase 5: Periodic (2s) drift measurement while playing
+  (`client/src/driftMonitor.js` pure functions + `Room.jsx`); expected
+  position from authoritative state + Phase 3 offset vs. actual position from
+  a new Web Audio scheduling anchor in `playbackEngine.js`; 80ms threshold,
+  2 consecutive violations required, 5s cooldown after correcting; corrections
+  reuse the existing seek-scheduling mechanism with a short local lead
+  (150ms, no network round trip needed); correction count tracked per-track;
+  drift/corrections surfaced in `Diagnostics` + optional device-list readout;
+  reported to server via `playback:driftReport`
+  (`server/driftHandlers.js`). 27 new scripted tests (20 drift-monitor unit +
+  3 playback-engine anchor unit + 4 server integration) - 58 total across the
+  project, all passing. Two-device audio drift verification not yet done by
+  the devs (needs real induced drift, e.g. via DevTools throttling - see
+  verification steps in chat).
 
 ## CURRENT
-- Awaiting manual browser/device verification of Phase 2 (see checklist in
-  chat: upload as host, confirm both tabs auto-download+decode+go READY,
-  replace track, invalid file type, oversized file), then start Phase 3:
-  robust clock-offset estimation + diagnostics UI.
+- Awaiting manual two-device browser verification of Phase 5 (see checklist
+  in chat: diagnostics panel shows live drift/correction count while
+  playing, induced drift via CPU/network throttling triggers a visible
+  correction after 2 consecutive violations, corrections stop within a
+  cooldown window, nothing happens while paused), then start Phase 6: late
+  join, reconnect handling, host-disconnect behavior.
 
 ## NEXT
-- Phase 3: Robust 8–10 sample clock-offset estimation + diagnostics UI.
-- Phase 4: Authoritative server playback state, versioned play/pause/seek,
-  scheduled execution on clients.
-- Phase 5: Periodic drift measurement + threshold-based correction.
 - Phase 6: Late join, reconnect handling, host-disconnect behavior.
 - Phase 7: Benchmarks, automated tests, error handling, README, UI polish.
 

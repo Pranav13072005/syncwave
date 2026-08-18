@@ -149,7 +149,9 @@ button {
 }
 
 .track-panel,
-.ready-panel {
+.ready-panel,
+.diagnostics-panel,
+.playback-panel {
   background: white;
   border: 1px solid #ddd;
   border-radius: 8px;
@@ -158,9 +160,62 @@ button {
 }
 
 .track-panel h2,
-.ready-panel h2 {
+.ready-panel h2,
+.diagnostics-panel h2,
+.playback-panel h2 {
   margin-top: 0;
   font-size: 1rem;
+}
+
+.playback-controls {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.playback-controls input {
+  width: 8rem;
+  margin-top: 0;
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+  margin: 0 0 0.75rem;
+}
+
+.diagnostics-grid dt {
+  color: #666;
+  font-size: 0.85rem;
+}
+
+.diagnostics-grid dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+.sync-status-synced {
+  color: #0a7d2c;
+}
+
+.sync-status-syncing {
+  color: #a15c00;
+}
+
+.sync-status-failed {
+  color: #b00020;
+}
+
+.sync-status-idle {
+  color: #666;
+}
+
+.device-rtt {
+  font-size: 0.75rem;
+  color: #666;
+  margin-left: auto;
 }
 
 .hint {
