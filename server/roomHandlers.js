@@ -2,6 +2,7 @@
 // logic to roomManager - this file only translates socket events <-> state
 // and broadcasts updates to the room.
 const roomManager = require('./roomManager');
+const { getSocketRoomCode } = require('./socketUtils');
 
 function registerRoomHandlers(io, socket) {
   socket.on('room:create', ({ name } = {}, ack) => {
@@ -36,11 +37,6 @@ function registerRoomHandlers(io, socket) {
     const room = roomManager.leaveRoom(socket.id);
     if (room) io.to(room.code).emit('room:update', roomManager.toPublicState(room));
   });
-}
-
-// socket.io v4 keeps a socket's own id plus any joined room names in socket.rooms.
-function getSocketRoomCode(socket) {
-  return Array.from(socket.rooms).find((r) => r !== socket.id) || null;
 }
 
 module.exports = registerRoomHandlers;

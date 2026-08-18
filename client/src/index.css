@@ -142,3 +142,42 @@ button {
   background: #e2ebff;
   color: #1d3ea3;
 }
+
+.badge-ready {
+  background: #dcf5e3;
+  color: #0a7d2c;
+}
+
+.track-panel,
+.ready-panel {
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+
+.track-panel h2,
+.ready-panel h2 {
+  margin-top: 0;
+  font-size: 1rem;
+}
+
+.hint {
+  color: #666;
+}
+
+.upload-control {
+  display: inline-block;
+  background: #1d3ea3;
+  color: white;
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.upload-control.disabled {
+  opacity: 0.6;
+  cursor: default;
+}

@@ -10,6 +10,8 @@ export default defineConfig({
         target: 'http://localhost:3001',
         ws: true,
       },
+      '/api': 'http://localhost:3001',
+      '/uploads': 'http://localhost:3001',
     },
   },
 })

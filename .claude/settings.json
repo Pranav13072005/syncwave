@@ -40,7 +40,22 @@
       "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter 'ProcessId=34832' | Select-Object ProcessId,CommandLine\")",
       "Bash(powershell -NoProfile -Command \"Stop-Process -Id 34832,31368 -Force -ErrorAction SilentlyContinue\")",
       "Bash(curl -s -m 5 -o /dev/null -w \"backend: HTTP %{http_code}\\\\n\" http://localhost:3001/)",
-      "Bash(curl -s -m 5 -o /dev/null -w \"frontend: HTTP %{http_code}\\\\n\" http://localhost:5173/)"
+      "Bash(curl -s -m 5 -o /dev/null -w \"frontend: HTTP %{http_code}\\\\n\" http://localhost:5173/)",
+      "Bash(mkdir -p \"/c/Users/prana/OneDrive/Desktop/syncwave/server/uploads\")",
+      "Bash(touch \"/c/Users/prana/OneDrive/Desktop/syncwave/server/uploads/.gitkeep\")",
+      "Bash(npm view *)",
+      "Bash(rm -rf node_modules package-lock.json)",
+      "Bash(node -e \"require\\('./uploadRoute'\\); require\\('./trackHandlers'\\); require\\('./roomManager'\\); require\\('./roomHandlers'\\); console.log\\('all modules load OK'\\);\")",
+      "Bash(powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Select-Object OwningProcess\")",
+      "Bash(node _phase2_smoketest.js)",
+      "Bash(powershell -NoProfile -Command \"Get-Process node -ErrorAction SilentlyContinue | Select-Object Id,StartTime\")",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''node.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*_phase2_smoketest*'\\\\'' } | Select-Object ProcessId,CommandLine')",
+      "Bash(powershell -NoProfile -Command \"Get-Process -Id 21652 -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue | Select-Object OwningProcess\")",
+      "Bash(curl -s -m 5 -o /dev/null -w \"Room.jsx: HTTP %{http_code}\\\\n\" http://localhost:5173/src/components/Room.jsx)",
+      "Bash(curl -s -m 5 -o /dev/null -w \"TrackPanel.jsx: HTTP %{http_code}\\\\n\" http://localhost:5173/src/components/TrackPanel.jsx)",
+      "Bash(curl -s -m 5 -o /dev/null -w \"api proxy: HTTP %{http_code}\\\\n\" -X POST http://localhost:5173/api/upload)",
+      "Bash(curl -s -m 5 -o /dev/null -w \"uploads proxy \\(404 expected, proves proxy works\\): HTTP %{http_code}\\\\n\" http://localhost:5173/uploads/doesnotexist.wav)"
     ],
     "additionalDirectories": [
       "c:\\Users\\prana\\OneDrive\\Desktop\\syncwave\\server\\public",

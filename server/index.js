@@ -9,20 +9,25 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const registerRoomHandlers = require('./roomHandlers');
+const registerTrackHandlers = require('./trackHandlers');
+const { createUploadRouter, UPLOAD_DIR } = require('./uploadRoute');
 
 const PORT = process.env.PORT || 3001;
 const SCHEDULE_LEAD_MS = 1000; // how far into the future we schedule play
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 const server = http.createServer(app);
 const io = new Server(server);
+app.use('/api', createUploadRouter(io));
 
 io.on('connection', (socket) => {
   console.log(`[connect] ${socket.id} (${io.engine.clientsCount} connected)`);
 
   registerRoomHandlers(io, socket);
+  registerTrackHandlers(io, socket);
 
   // Single-sample Cristian's-algorithm style clock offset probe.
   // Phase 3 replaces this with an 8-10 sample, low-RTT/median robust estimate.
