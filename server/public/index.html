@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>SyncWave - Phase 0 PoC</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.25rem; }
+  button { font-size: 1rem; padding: 0.5rem 1rem; margin-right: 0.5rem; }
+  #log { background: #111; color: #0f0; font-family: monospace; font-size: 0.8rem;
+         padding: 0.75rem; height: 240px; overflow-y: auto; white-space: pre-wrap; margin-top: 1rem; }
+  .stat { display: inline-block; margin-right: 1.5rem; }
+  .stat b { display: block; font-size: 1.1rem; }
+</style>
+</head>
+<body>
+  <h1>SyncWave — Phase 0: Scheduled Playback PoC</h1>
+  <p>Open this page on two devices/tabs on the same network, load audio on both, then click Play on either one.</p>
+
+  <div>
+    <span class="stat">Connection<b id="stat-conn">-</b></span>
+    <span class="stat">Clock offset (ms)<b id="stat-offset">-</b></span>
+    <span class="stat">RTT (ms)<b id="stat-rtt">-</b></span>
+    <span class="stat">Audio<b id="stat-audio">not loaded</b></span>
+  </div>
+
+  <p>
+    <button id="btn-load">1. Load Audio</button>
+    <button id="btn-play" disabled>2. Play (scheduled)</button>
+  </p>
+
+  <div id="log"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="client.js"></script>
+</body>
+</html>
