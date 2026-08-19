@@ -71,9 +71,16 @@ export default function Room({ initialState, onLeave }) {
     function handleDisconnect() {
       setConnected(false);
       // We can no longer be confident our local view is current - recovery
-      // prerequisites drop until a fresh rejoin + re-sync confirm otherwise.
+      // prerequisites drop until a fresh rejoin + re-sync confirm otherwise
+      // (this also blocks drift correction, gated on clockSynced).
       setRoomJoined(false);
       setHasLatestState(false);
+      setClockSynced(false);
+      // Stop local audio immediately - do NOT touch authoritative room state
+      // or broadcast a pause; this device is simply isolating itself.
+      // Decoded buffer is untouched (bufferRef), so reconnect can resume
+      // without re-decoding.
+      resetPlaybackEngine();
     }
 
     socket.on('room:update', handleUpdate);
@@ -134,6 +141,23 @@ export default function Room({ initialState, onLeave }) {
     return () => resetPlaybackEngine();
   }, []);
 
+  // The browser's own network-loss signal often fires faster than Socket.IO
+  // notices (which waits out a ping/pong timeout), so it's used here purely
+  // to react sooner with the same "stop local audio" action as the socket
+  // disconnect handler above. It does NOT touch room membership/prerequisite
+  // state - Socket.IO's own connect/disconnect/reconnect events remain the
+  // sole authority for that, per the "keep server state authoritative"
+  // requirement. Calling resetPlaybackEngine() twice in quick succession
+  // (once here, once from the socket 'disconnect' that typically follows) is
+  // harmless - it's a no-op once nothing is playing.
+  useEffect(() => {
+    function handleOffline() {
+      resetPlaybackEngine();
+    }
+    window.addEventListener('offline', handleOffline);
+    return () => window.removeEventListener('offline', handleOffline);
+  }, []);
+
   // Downloads + decodes the current track whenever it changes (new upload,
   // or a track that already existed when audio was enabled). A stale
   // in-flight decode is ignored if the track changes again before it
@@ -171,19 +195,33 @@ export default function Room({ initialState, onLeave }) {
   // applied (recoveryState.js never queues). Reuses the same
   // schedulePlay/schedulePause Phase 4 already established; a paused state is
   // adopted (position/status shown) without ever calling schedulePlay.
+  //
+  // For a 'playing' state, tryConsumePending recomputes the actual position
+  // to start from (via computeScheduledPlayingState) instead of using the
+  // command's original positionSec/anchorServerTime as-is - by the time a
+  // late joiner or a recovering client is ready, that snapshot can be
+  // arbitrarily old, so passing it straight through would start audio from
+  // the WRONG position (this was the late-join-starts-at-0 bug: it always
+  // schedules relative to "now", but was using a stale offset for how far
+  // into the track that "now" actually corresponds to).
   useEffect(() => {
     const trackDecoded = state.track == null || decodedVersion === state.track.version;
-    const { nextState, toApply } = tryConsumePending(recoveryStateRef.current, {
-      roomJoined,
-      hasLatestState,
-      trackDecoded,
-      clockSynced,
-    });
+    const offsetMs = getClockOffsetMs();
+    // Only meaningful once clockSynced is true, which arePrerequisitesMet
+    // already requires before toApply can be non-null - never relied upon
+    // as a 0ms fallback for actual scheduling.
+    const nowServerTimeMs = offsetMs !== null ? Date.now() + offsetMs : null;
+
+    const { nextState, toApply } = tryConsumePending(
+      recoveryStateRef.current,
+      { roomJoined, hasLatestState, trackDecoded, clockSynced },
+      { nowServerTimeMs, durationSec: state.track?.durationSec ?? null },
+    );
     recoveryStateRef.current = nextState;
     if (!toApply) return;
 
     if (toApply.status === 'paused') {
-      schedulePause(toApply.anchorServerTime, getClockOffsetMs());
+      schedulePause(toApply.anchorServerTime, offsetMs);
       return;
     }
 
@@ -194,7 +232,7 @@ export default function Room({ initialState, onLeave }) {
       console.warn(`Playback pending: track v${toApply.trackVersion} not decoded on this device yet`);
       return;
     }
-    schedulePlay(decoded.buffer, toApply.positionSec, toApply.anchorServerTime, getClockOffsetMs());
+    schedulePlay(decoded.buffer, toApply.positionSec, toApply.anchorServerTime, offsetMs);
   }, [roomJoined, hasLatestState, clockSynced, decodedVersion, state.track?.version, state.playback?.version]);
 
   // Periodic drift measurement + threshold-based correction. Does nothing at

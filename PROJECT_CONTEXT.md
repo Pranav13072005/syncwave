@@ -186,16 +186,33 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
     reimplemented), it's applied via the *same* `schedulePlay`/`schedulePause`
     Phase 4 established, exactly like a normal play/pause/seek broadcast. A
     stale/duplicate pending state (not newer) is discarded without applying.
+  - For a `'playing'` pending state, `tryConsumePending` does NOT pass the
+    command's original `positionSec`/`anchorServerTime` straight through -
+    that snapshot is only valid at the moment the command was issued, and by
+    the time recovery finishes (late join or reconnect), real time has moved
+    on. It instead calls `computeScheduledPlayingState(playback,
+    nowServerTimeMs, {leadMs, durationSec})`: `targetServerTime =
+    max(anchorServerTime, nowServerTimeMs + RECOVERY_SCHEDULING_LEAD_MS)`,
+    then `positionSec = computeExpectedPositionSec(playback,
+    targetServerTime)` - the exact same canonical-position formula the
+    server's `getCanonicalPosition` and the drift monitor already use, not a
+    duplicate. Clamped to `durationSec` when known. Because `targetServerTime`
+    is never earlier than the command's own `anchorServerTime`, a promptly-
+    applied command (the normal case) is completely unaffected - the max()
+    picks `anchorServerTime` and the position passes through unchanged; this
+    recalculation only does anything once `anchorServerTime` is already in
+    the past, i.e. exactly the late-join/recovery case it exists for.
   - Late join: prerequisites simply start unmet (except `roomJoined`/
     `hasLatestState`, true immediately from the join ack) and become met one
     by one (clock sync completes, decode finishes) - no special-cased "late
     join" code path exists; it's the same mechanism as any other recovery.
-    If the room is playing, the join ack's `playback.anchorServerTime` is
-    already in the past, so `schedulePlay`'s `Math.max(ctx.currentTime, ...)`
-    clamp starts it immediately at the (server-authoritative) extrapolated
-    position. If paused, `schedulePause` on a fresh engine (nothing playing)
-    is a safe no-op - the paused position is simply adopted for display via
-    `state.playback.positionSec`, with no audio ever started.
+    If the room is playing, the position above is calculated for the actual
+    moment scheduling happens, so the device starts silent-until-ready and
+    then begins directly at the correct elapsed position - never at 0 and
+    never audibly starting-then-jumping. If paused, `schedulePause` on a
+    fresh engine (nothing playing) is a safe no-op - the paused position is
+    simply adopted for display via `state.playback.positionSec`, with no
+    audio ever started.
   - Reconnect: on the Socket.IO manager's `reconnect` event, `roomJoined`,
     `hasLatestState`, and `clockSynced` are all explicitly reset to false
     (guarded against overlapping rejoin attempts via `rejoinInFlightRef`),
@@ -210,6 +227,21 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
     doesn't depend on the connection) - only a genuinely new/different track
     (revealed by the fresh post-reconnect state) triggers the existing decode
     effect, unchanged from Phase 4.
+  - Disconnect: the moment the socket `disconnect` event fires (or, faster in
+    practice, the browser's own `window` `offline` event - both call the
+    exact same `resetPlaybackEngine()`), this device's local Web Audio source
+    is stopped immediately. This does NOT call `playback:pause` or touch
+    authoritative room state in any way - a participant losing connectivity
+    is purely a local event; other devices keep playing uninterrupted. The
+    decoded `AudioBuffer` (`bufferRef.current`, a `Room.jsx`-level ref, not
+    touched by `resetPlaybackEngine()`) is preserved, so a reconnect doesn't
+    need to re-download/re-decode. `clockSynced` is also dropped immediately
+    on disconnect (not just on the later `reconnect` event), which - via
+    `canMeasureDrift`'s `hasClockSync` gate - stops drift correction from
+    running during the disconnected/recovering window too. The `offline`
+    listener never touches `roomJoined`/room-membership state; only
+    Socket.IO's own connect/disconnect/reconnect events do that, per "keep
+    server state authoritative for room membership."
 - Host reassignment + room cleanup (Phase 6, `server/roomManager.js`): when
   the current host's socket disconnects (or leaves), `promoteNewHost` picks
   the remaining client with the lowest `joinedAt` (deterministic - always the
@@ -325,12 +357,12 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
   this explicitly and skips creating a source rather than letting Web Audio
   do it implicitly, so the "nothing to play" case is deliberate, not
   incidental).
-- A device with no clock-sync estimate yet (`getClockOffsetMs()` returns
-  `null`) falls back to `offsetMs = 0` for scheduling rather than refusing to
-  play - a `console.warn`-documented best-effort degradation (assumes clocks
-  are reasonably close, often true on a LAN) rather than a new UI state,
-  since "block playback entirely until synced" felt like the wrong tradeoff
-  for a device that just hasn't finished its first sync round yet.
+- (Phase 4, SUPERSEDED by Phase 6) A device with no clock-sync estimate yet
+  used to fall back to `offsetMs = 0` for scheduling rather than refusing to
+  play. Phase 6 removed this: the `clockSynced` recovery prerequisite now
+  means nothing is scheduled at all until a real sync has completed - see
+  "Recovery" below and the Phase 6 bugfix entry in Known issues. Left here as
+  a record of the earlier (now-reverted) tradeoff, not the current behavior.
 - `PlaybackControls` shows a live-ish extrapolated position (`~12.3s`,
   updated every 250ms via `setInterval` while playing) using the exact same
   extrapolation formula as the server's `getCanonicalPosition`, but this is
@@ -397,6 +429,33 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
   No throttling/deduping added - acceptable chatter for the MVP's small-room
   scale; revisit only if it becomes a real problem (Phase 7 benchmarking
   would surface that).
+- Phase 6 bugfix round (found via real laptop/phone testing, fixed before
+  Phase 7 started): late join was silently starting audio at track position
+  0 for 1-2s before the drift monitor corrected it. Root cause: the recovery
+  apply path passed the authoritative command's original
+  `positionSec`/`anchorServerTime` straight to `schedulePlay` unchanged. That
+  snapshot is only valid at the instant the command was issued; `schedulePlay`
+  itself already clamps a past `anchorServerTime` to "start now"
+  (`Math.max(ctx.currentTime, ...)`), but was still being told to start at
+  the OLD (stale) buffer offset, i.e. correct time, wrong position. Grepped
+  every `schedulePlay` call site to confirm there was no second/legacy
+  effect bypassing `recoveryState.js` - there wasn't; the bug was entirely in
+  `tryConsumePending` not recalculating position at all. Fixed by adding
+  `computeScheduledPlayingState` (reuses `computeExpectedPositionSec` from
+  `driftMonitor.js`, not a duplicate formula) and threading a `context`
+  parameter (`nowServerTimeMs`, `durationSec`) through `tryConsumePending`.
+  Chose a 3rd parameter over folding it into `prereqs` because it's data
+  (a timestamp/duration), not a boolean gate - keeping the distinction
+  legible in the function signature.
+- Same round: a participant's socket disconnecting mid-playback used to
+  leave its local Web Audio source running indefinitely (Web Audio doesn't
+  care about socket state) rather than stopping. Fixed by calling the
+  existing `resetPlaybackEngine()` (already used for "leave room" - no new
+  function needed) from both the socket `disconnect` handler and a new
+  `window` `offline` listener. The `offline` event is purely a faster
+  trigger for the identical action; Socket.IO's own `disconnect` already
+  fires the correct sequence and remains what actually resets recovery
+  prerequisites - the offline handler doesn't duplicate or race that.
 
 ## Completed features
 - Phase 0: Socket.IO connection between server and multiple clients; shared
@@ -496,6 +555,22 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
   token rejection/room cleanup grace period/duplicate-member prevention/
   late-join+reconnect data flow) - 94 scripted tests total across the whole
   project, all passing.
+  **Bugfix round** (real-device testing found two recovery bugs before
+  Phase 7 started - see "Important decisions"): (1) late join was starting
+  audio at position 0 for 1-2s before drift-correcting, fixed by
+  `computeScheduledPlayingState` recalculating the actual position at the
+  real scheduling moment instead of reusing a stale snapshot; (2) a
+  disconnected participant's local audio kept playing instead of stopping,
+  fixed by calling the existing `resetPlaybackEngine()` from both the socket
+  `disconnect` handler and a new `window` `offline` listener, without
+  touching authoritative state or broadcasting a pause. 9 more scripted
+  tests (7 client: exact late-join position formula, significant-elapsed-
+  period late join, no-schedule-before-all-prerequisites, no-position-0
+  late join, prompt-client-unaffected, duration clamping, reconnect
+  resuming from the recalculated position; 2 server: no room-wide pause from
+  a participant disconnect, reconnect resumes from the authoritative CURRENT
+  position after the host changed it mid-disconnect) - 103 scripted tests
+  total across the whole project, all passing.
 
 ## Known issues
 - The real app's clock-offset estimate (Phase 3) is robust (9-sample,
@@ -545,3 +620,14 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
 - Multer 1.x was initially installed by mistake (deprecated/vulnerable);
   corrected to Multer `^2.2.0` before first use — no vulnerable version ever
   ran with real uploads enabled.
+- The actual "audio stops immediately on disconnect" behavior
+  (`resetPlaybackEngine()` calling `AudioBufferSourceNode.stop()`) can only
+  be verified in a real browser - `getAudioContext()` requires `window`,
+  which doesn't exist under Node, so it's structurally untestable with this
+  project's `node --test` setup (consistent with every other AudioContext-
+  touching function since Phase 0). What IS scripted-test-covered: the
+  server-side guarantee that a participant's disconnect never alters
+  authoritative playback or triggers a pause
+  (`server/test/disconnectRecovery.test.js`), and the client-side pure
+  position-calculation fix (`recoveryState.unit.test.mjs`). The actual local
+  audio stop must be confirmed by ear/eye per the manual verification steps.

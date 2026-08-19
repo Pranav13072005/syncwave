@@ -78,18 +78,40 @@
   (13 recovery-state unit + 3 driftMonitor gate + 1 clockSync pub/sub +
   19 server: host reassignment, former-host token rejection, room cleanup
   grace period, duplicate-member prevention, late-join/reconnect data flow) -
-  94 scripted tests total across the whole project, all passing. Real
-  multi-device (laptop/phone) manual verification not yet done by the devs.
+  94 scripted tests total across the whole project, all passing.
+- Phase 6 bugfix round: real laptop/phone testing found (1) late join
+  audibly starting at track position 0 for 1-2s before the drift monitor
+  corrected it, and (2) a disconnected participant's local audio continuing
+  to play instead of stopping. Fixed: `computeScheduledPlayingState`
+  (`client/src/recoveryState.js`) now recalculates the actual position at
+  the real scheduling moment (reusing `computeExpectedPositionSec`, not a
+  duplicate formula) instead of passing through the original command's
+  stale snapshot; confirmed via grep that no other `schedulePlay` call site
+  bypasses `recoveryState.js`. `resetPlaybackEngine()` (already existed for
+  "leave room") is now also called from the socket `disconnect` handler and
+  a new `window` `offline` listener, stopping local audio immediately
+  without touching authoritative state or broadcasting a pause; `clockSynced`
+  drops immediately on disconnect too, which also halts drift correction
+  during the disconnected/recovering window. 9 new scripted tests (7 client:
+  exact late-join position formula, significant-elapsed-period late join,
+  no-schedule-before-all-prerequisites, no-position-0 late join, prompt-
+  client-unaffected regression, duration clamping, reconnect resuming from
+  the recalculated position; 2 server: no room-wide pause from a participant
+  disconnect, reconnect resumes from the authoritative CURRENT position
+  after the host changed it mid-disconnect) - 103 scripted tests total, all
+  passing. The actual local-audio-stop-on-disconnect behavior itself can only
+  be verified in a real browser (no `window`/AudioContext under Node, same
+  limitation as all Web-Audio-touching code since Phase 0).
 
 ## CURRENT
-- Awaiting manual laptop/phone verification of Phase 6 (see checklist in
-  chat: late join mid-playback adopts the current position, late join while
-  paused stays silent at the right position, killing/restoring Wi-Fi on one
-  device triggers automatic rejoin + resync, host disconnect promotes
-  another device and the old host returns as a normal participant on
-  reconnect, an empty room survives a quick rejoin but is gone after ~30s),
-  then start Phase 7: benchmarks, automated tests, error handling, README,
-  UI polish.
+- Awaiting a second round of real laptop/phone verification confirming both
+  fixes hold (see checklist in chat: late join mid-playback stays silent
+  then starts directly at the correct elapsed position with no audible
+  jump/correction; killing Wi-Fi on a playing device stops its audio
+  immediately without pausing other devices; reconnecting resumes from the
+  room's current position, including if the host changed something while
+  the device was offline), then start Phase 7: benchmarks, automated tests,
+  error handling, README, UI polish.
 
 ## NEXT
 - Phase 7: Benchmarks, automated tests, error handling, README, UI polish.
