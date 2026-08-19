@@ -48,6 +48,18 @@ export function getLastSyncStatus() {
   return lastSyncStatus;
 }
 
+// Phase 6: lets other modules (Room.jsx's recovery-prerequisite tracking)
+// react the moment a sync round finishes, without needing to own/duplicate
+// the trigger themselves - Diagnostics.jsx remains the only thing that calls
+// runClockSync (on mount and on Socket.IO reconnect); this just makes its
+// result observable elsewhere too.
+const resultListeners = new Set();
+
+export function onClockSyncResult(listener) {
+  resultListeners.add(listener);
+  return () => resultListeners.delete(listener);
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -91,5 +103,6 @@ export async function runClockSync(socket, {
   const result = computeRobustEstimate(samples);
   lastKnownOffsetMs = result.offsetMs;
   lastSyncStatus = result.status;
+  resultListeners.forEach((listener) => listener(result));
   return result;
 }

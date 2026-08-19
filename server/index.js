@@ -3,6 +3,7 @@
 // app's room/track/clock/playback/drift handlers registered below.
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -11,7 +12,17 @@ const registerTrackHandlers = require('./trackHandlers');
 const registerClockHandlers = require('./clockHandlers');
 const registerPlaybackHandlers = require('./playbackHandlers');
 const registerDriftHandlers = require('./driftHandlers');
+const roomManager = require('./roomManager');
 const { createUploadRouter, UPLOAD_DIR } = require('./uploadRoute');
+
+// Phase 6: when a room is finally deleted (its empty-room grace period
+// expired), delete its uploaded track file too - roomManager.js itself
+// deliberately has no filesystem knowledge.
+roomManager.onRoomDeleted((room) => {
+  if (room.track?.storedFilename) {
+    fs.unlink(path.join(UPLOAD_DIR, room.track.storedFilename), () => {});
+  }
+});
 
 const PORT = process.env.PORT || 3001;
 const SCHEDULE_LEAD_MS = 1000; // how far into the future we schedule play

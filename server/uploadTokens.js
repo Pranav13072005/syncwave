@@ -22,4 +22,13 @@ function consumeToken(token) {
   return entry;
 }
 
-module.exports = { createToken, consumeToken };
+// Removes every outstanding token for a room (Phase 6: called when a room is
+// finally deleted after its cleanup grace period, so no leftover token could
+// ever be replayed against a future room that happens to reuse the same code).
+function purgeRoom(roomCode) {
+  for (const [token, entry] of tokens.entries()) {
+    if (entry.roomCode === roomCode) tokens.delete(token);
+  }
+}
+
+module.exports = { createToken, consumeToken, purgeRoom };

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { socket } from '../socket';
 import { unlockAudioContext, decodeTrackFromUrl } from '../audioEngine';
-import { schedulePlay, schedulePause, resetPlaybackEngine, isNewerPlaybackVersion, getActualPositionSec } from '../playbackEngine';
-import { getClockOffsetMs } from '../clockSync';
+import { schedulePlay, schedulePause, resetPlaybackEngine, getActualPositionSec } from '../playbackEngine';
+import { getClockOffsetMs, getLastSyncStatus, onClockSyncResult } from '../clockSync';
+import { arePrerequisitesMet, createInitialRecoveryState, receivePlaybackState, tryConsumePending } from '../recoveryState';
 import {
   computeExpectedPositionSec,
   computeDriftMs,
@@ -37,20 +38,42 @@ export default function Room({ initialState, onLeave }) {
   const [decodedVersion, setDecodedVersion] = useState(null); // triggers a re-check when decode catches up to a pending command
   const [driftMs, setDriftMs] = useState(null);
   const [correctionCount, setCorrectionCount] = useState(0);
+
+  // Phase 6 recovery prerequisites. All four must hold before any
+  // synchronized playback is scheduled - see recoveryState.js.
+  const [roomJoined, setRoomJoined] = useState(true); // true already: Room only mounts after Landing's successful join
+  const [hasLatestState, setHasLatestState] = useState(true); // initialState IS the latest state at mount
+  const [clockSynced, setClockSynced] = useState(getLastSyncStatus() === 'synced');
+
   const bufferRef = useRef({ version: null, buffer: null }); // decoded AudioBuffer for the current track version
-  const appliedPlaybackVersionRef = useRef(-1); // last playback.version actually scheduled
+  const recoveryStateRef = useRef(createInitialRecoveryState());
   const driftStateRef = useRef(createInitialDriftState()); // consecutiveViolations/cooldown - reset whenever a new authoritative command arrives
   const driftTrackVersionRef = useRef(null); // which track the correction count is scoped to
+  const roomCodeRef = useRef(initialState.roomCode); // remembered for reconnect rejoin - room code never changes for this session
+  const myNameRef = useRef(initialState.clients.find((c) => c.id === socket.id)?.name || 'Device');
+  const rejoinInFlightRef = useRef(false);
+
+  // Seed the recovery machinery with the state we already have at mount.
+  useEffect(() => {
+    recoveryStateRef.current = receivePlaybackState(recoveryStateRef.current, initialState.playback);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     function handleUpdate(newState) {
       setState(newState);
+      recoveryStateRef.current = receivePlaybackState(recoveryStateRef.current, newState.playback);
+      setHasLatestState(true);
     }
     function handleConnect() {
       setConnected(true);
     }
     function handleDisconnect() {
       setConnected(false);
+      // We can no longer be confident our local view is current - recovery
+      // prerequisites drop until a fresh rejoin + re-sync confirm otherwise.
+      setRoomJoined(false);
+      setHasLatestState(false);
     }
 
     socket.on('room:update', handleUpdate);
@@ -62,6 +85,48 @@ export default function Room({ initialState, onLeave }) {
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
     };
+  }, []);
+
+  // Reconnect recovery: Socket.IO hands us a brand-new socket.id on
+  // reconnect and does not auto-rejoin rooms, so we rejoin explicitly using
+  // the room code/name remembered from this session. Only once the rejoin
+  // ack succeeds do roomJoined/hasLatestState become true again; clockSynced
+  // is also dropped here so a stale pre-reconnect offset can't be relied on -
+  // Diagnostics.jsx already triggers a fresh sync on this same 'reconnect'
+  // event, and our onClockSyncResult subscription (below) picks up its result.
+  useEffect(() => {
+    function handleReconnect() {
+      if (rejoinInFlightRef.current) return; // guard against overlapping rejoin attempts
+      rejoinInFlightRef.current = true;
+      setRoomJoined(false);
+      setHasLatestState(false);
+      setClockSynced(false);
+      socket.emit('room:join', { roomCode: roomCodeRef.current, name: myNameRef.current }, (ack) => {
+        rejoinInFlightRef.current = false;
+        if (!ack?.ok) {
+          console.warn('Failed to rejoin room after reconnect:', ack?.error);
+          onLeave();
+          return;
+        }
+        setState(ack.state);
+        recoveryStateRef.current = receivePlaybackState(recoveryStateRef.current, ack.state.playback);
+        setRoomJoined(true);
+        setHasLatestState(true);
+      });
+    }
+
+    socket.io.on('reconnect', handleReconnect);
+    return () => {
+      socket.io.off('reconnect', handleReconnect);
+    };
+  }, [onLeave]);
+
+  // Reacts to clock-sync completion (triggered by Diagnostics.jsx on mount
+  // and on reconnect) without duplicating that trigger here.
+  useEffect(() => {
+    return onClockSyncResult((result) => {
+      setClockSynced(result.status === 'synced');
+    });
   }, []);
 
   // Stop any scheduled/playing audio when leaving this room entirely.
@@ -98,39 +163,49 @@ export default function Room({ initialState, onLeave }) {
     };
   }, [audioEnabled, state.track?.version, state.track?.url, retryTick]);
 
-  // Applies the authoritative playback state to the local Web Audio engine.
-  // Ignores stale/duplicate versions. If this device hasn't decoded the
-  // track version the command applies to yet, the command is left pending
-  // (NOT marked applied) rather than dropped - once decode catches up
-  // (decodedVersion changes), this effect re-runs and retries it. This
-  // matters even outside late-join: a host can click Play before their own
-  // device finishes decoding a just-uploaded track.
+  // Prerequisite-driven recovery apply: room joined + latest state received +
+  // current track decoded + clock synchronized must ALL hold before anything
+  // is scheduled. Covers late join (prerequisites start unmet, become met one
+  // by one) and reconnect (explicitly reset, then re-earned) via the exact
+  // same path - no parallel mechanism. Only the newest pending state is ever
+  // applied (recoveryState.js never queues). Reuses the same
+  // schedulePlay/schedulePause Phase 4 already established; a paused state is
+  // adopted (position/status shown) without ever calling schedulePlay.
   useEffect(() => {
-    const pb = state.playback;
-    if (!pb || !isNewerPlaybackVersion(pb.version, appliedPlaybackVersionRef.current)) return;
+    const trackDecoded = state.track == null || decodedVersion === state.track.version;
+    const { nextState, toApply } = tryConsumePending(recoveryStateRef.current, {
+      roomJoined,
+      hasLatestState,
+      trackDecoded,
+      clockSynced,
+    });
+    recoveryStateRef.current = nextState;
+    if (!toApply) return;
 
-    if (pb.status === 'paused') {
-      appliedPlaybackVersionRef.current = pb.version;
-      schedulePause(pb.anchorServerTime, getClockOffsetMs());
+    if (toApply.status === 'paused') {
+      schedulePause(toApply.anchorServerTime, getClockOffsetMs());
       return;
     }
 
     const decoded = bufferRef.current;
-    if (!decoded.buffer || decoded.version !== pb.trackVersion) {
-      console.warn(`Playback pending: track v${pb.trackVersion} not decoded on this device yet`);
-      return; // not consumed - retried once decodedVersion catches up
+    if (!decoded.buffer || decoded.version !== toApply.trackVersion) {
+      // Shouldn't normally happen given trackDecoded already gated this -
+      // stay defensive rather than schedule the wrong audio.
+      console.warn(`Playback pending: track v${toApply.trackVersion} not decoded on this device yet`);
+      return;
     }
-    appliedPlaybackVersionRef.current = pb.version;
-    schedulePlay(decoded.buffer, pb.positionSec, pb.anchorServerTime, getClockOffsetMs());
-  }, [state.playback?.version, state.playback?.status, state.playback?.trackVersion, decodedVersion]);
+    schedulePlay(decoded.buffer, toApply.positionSec, toApply.anchorServerTime, getClockOffsetMs());
+  }, [roomJoined, hasLatestState, clockSynced, decodedVersion, state.track?.version, state.playback?.version]);
 
   // Periodic drift measurement + threshold-based correction. Does nothing at
-  // all while paused (no interval is even created). Whenever a new
-  // authoritative command arrives (playback.version changes), the violation
-  // streak/cooldown are reset - a stale streak from a superseded command must
-  // never trigger a correction against the new one. The correction counter is
-  // scoped to the current track (reset on track change), not to every
-  // individual command, so normal play/pause/seek don't zero out the stat.
+  // all while paused (no interval is even created), and canMeasureDrift also
+  // refuses to run without a genuinely completed clock sync (no 0ms
+  // fallback - see driftMonitor.js). Whenever a new authoritative command
+  // arrives (playback.version changes) or clock sync status changes, the
+  // violation streak/cooldown are reset - a stale streak must never trigger
+  // a correction against a superseded command or an unverified clock. The
+  // correction counter is scoped to the current track (reset on track
+  // change), not to every individual command.
   useEffect(() => {
     const pb = state.playback;
     if (!pb || pb.status !== 'playing') {
@@ -148,12 +223,12 @@ export default function Room({ initialState, onLeave }) {
     const intervalId = setInterval(() => {
       const decoded = bufferRef.current;
       const decodedTrackVersion = decoded.buffer ? decoded.version : null;
-      if (!canMeasureDrift(pb, decodedTrackVersion)) return;
+      if (!canMeasureDrift(pb, decodedTrackVersion, clockSynced)) return;
 
       const actualPositionSec = getActualPositionSec();
       if (actualPositionSec === null) return; // nothing actually scheduled/playing locally yet
 
-      const offsetMs = getClockOffsetMs() ?? 0;
+      const offsetMs = getClockOffsetMs(); // non-null here: canMeasureDrift's clockSynced check already gated this
       const nowServerMs = Date.now() + offsetMs;
       const expectedPositionSec = computeExpectedPositionSec(pb, nowServerMs);
       const drift = computeDriftMs(actualPositionSec, expectedPositionSec);
@@ -173,7 +248,7 @@ export default function Room({ initialState, onLeave }) {
     }, DEFAULT_MEASURE_INTERVAL_MS);
 
     return () => clearInterval(intervalId);
-  }, [state.playback?.version, state.playback?.status, state.playback?.trackVersion]);
+  }, [state.playback?.version, state.playback?.status, state.playback?.trackVersion, clockSynced]);
 
   async function handleEnableAudio() {
     try {
@@ -193,6 +268,12 @@ export default function Room({ initialState, onLeave }) {
   }
 
   const isHost = state.hostId === socket.id;
+  const recoveryReady = arePrerequisitesMet({
+    roomJoined,
+    hasLatestState,
+    trackDecoded: state.track == null || decodedVersion === state.track.version,
+    clockSynced,
+  });
 
   return (
     <div className="room">
@@ -200,6 +281,7 @@ export default function Room({ initialState, onLeave }) {
         <div>
           <span className="conn-dot" data-connected={connected} />
           {connected ? 'Connected' : 'Disconnected'}
+          {!recoveryReady && connected && <span className="hint"> — synchronizing…</span>}
         </div>
         <button onClick={handleLeave}>Leave Room</button>
       </header>

@@ -26,12 +26,18 @@ persistence). Current shape:
 ```
 {
   code, hostId,
-  clients: Map<socketId, {id, name, isHost, rtt, clockOffsetMs, syncStatus, driftMs, driftCorrectionCount}>,
+  clients: Map<socketId, {id, name, rtt, clockOffsetMs, syncStatus, driftMs, driftCorrectionCount, joinedAt}>,
   track: null | { version, originalName, mimeType, size, url, storedFilename, uploadedAt, durationSec? },
   readyDevices: Set<socketId>,  // devices that decoded `track` at its current version
   playback: { status: 'playing'|'paused', positionSec, anchorServerTime, version, trackVersion },
+  emptyingTimer: Timeout | null,  // Phase 6: set while the room is empty and mid-grace-period
 }
 ```
+`isHost` is NOT stored per-client (Phase 6 removed it from the client record) -
+it's computed in `toPublicState()` as `c.id === room.hostId`, so host
+reassignment can never leave a stale flag on some other client. `joinedAt`
+(Phase 6, `Date.now()` at join time) is used to deterministically pick the
+longest-connected remaining member to promote on host disconnect.
 `driftMs`/`driftCorrectionCount` (Phase 5) default `null`/`0` until the client
 reports a drift measurement via `playback:driftReport` - purely informational,
 same policy as `rtt`/`clockOffsetMs`.
@@ -59,7 +65,7 @@ Phase 0 PoC events (still live, untouched, served at `server/public/*`):
 
 Phase 1 room events (real app, `server/roomHandlers.js` + `client/src/components/*`):
 - `room:create` (client→server, ack) — `{ name }` in, ack `{ ok, state }` where `state = { roomCode, hostId, clients }`. Creator becomes host.
-- `room:join` (client→server, ack) — `{ roomCode, name }` in, ack `{ ok, state }` or `{ ok: false, error: 'ROOM_NOT_FOUND' }`.
+- `room:join` (client→server, ack) — `{ roomCode, name }` in, ack `{ ok, state }` or `{ ok: false, error: 'ROOM_NOT_FOUND' }`. Also reused (Phase 6, unchanged signature) for reconnect rejoin - `client/src/components/Room.jsx` calls it again on the Socket.IO `reconnect` event using the room code/name remembered from the original join. If the room is mid-grace-period (empty, pending cleanup), joining cancels the cleanup and restores it; if the room was empty, the joiner becomes host.
 - `room:leave` (client→server, ack) — no payload; ack `{ ok: true }`. Also triggered implicitly by socket `disconnect`.
 - `room:update` (server→room) — broadcast to all sockets in the room whenever membership, host, track, or ready state changes; full `state` payload (not a diff).
 
@@ -71,7 +77,7 @@ Phase 2 track events (`server/trackHandlers.js`, `server/uploadRoute.js`, `clien
 
 Phase 3 clock-sync events (`client/src/clockSync.js`, `client/src/components/Diagnostics.jsx`, `server/clockHandlers.js`):
 - `clock:ping` (client→server, ack) — unchanged from Phase 0; now also the low-level primitive the Phase 3 protocol samples 9 times per sync round.
-- `clock:report` (client→server, ack) — `{ rtt, offsetMs, status }` in (the client's own robust estimate); ack `{ ok }`. Stores the result on the reporting client's room entry and broadcasts `room:update`; `{ ok: false }` (no-op) if the socket isn't currently in a room (e.g. mid-reconnect, before Phase 6 re-join exists).
+- `clock:report` (client→server, ack) — `{ rtt, offsetMs, status }` in (the client's own robust estimate); ack `{ ok }`. Stores the result on the reporting client's room entry and broadcasts `room:update`; `{ ok: false }` (no-op) if the socket isn't currently in a room. Since Phase 6, this is only a brief window during reconnect (before `Room.jsx`'s rejoin completes), not a lasting gap.
 
 Phase 4 playback events (`server/playbackHandlers.js`, `client/src/playbackEngine.js` + `PlaybackControls.jsx`):
 - `playback:play` (client→server, ack) — no payload. Host-only. Resumes from the current canonical position (whatever it is) at a future `targetServerTime`; ack `{ ok: false, error: 'NOT_HOST' | 'NO_ROOM' | 'NO_TRACK' }` on rejection.
@@ -82,6 +88,9 @@ Phase 4 playback events (`server/playbackHandlers.js`, `client/src/playbackEngin
 
 Phase 5 drift events (`server/driftHandlers.js`, `client/src/driftMonitor.js` + `Room.jsx`):
 - `playback:driftReport` (client→server, ack) — `{ driftMs, correctionCount }` in (this client's latest self-measured drift and cumulative correction count for the current track); ack `{ ok }`. Stores it on the reporting client's room entry and broadcasts `room:update`, same no-op-if-no-room policy as `clock:report`. Purely informational, never used to derive authoritative state.
+
+Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as noted above; the new mechanism lives in `client/src/recoveryState.js`, `server/roomManager.js`'s promotion/cleanup logic, and `server/uploadRoute.js`'s host re-check):
+- `POST /api/upload` gained one more rejection: after consuming the token, the route re-checks that the token's `socketId` is *still* the room's current `hostId` (not just at token-issue time). A former host's already-issued-but-unused token now fails with the same `403 INVALID_TOKEN` once host ownership has changed.
 
 ## Synchronization algorithm (current state)
 - Clock offset (Phase 3, `client/src/clockSync.js`): 9 sequential Cristian's-
@@ -154,6 +163,69 @@ Phase 5 drift events (`server/driftHandlers.js`, `client/src/driftMonitor.js` + 
     device's decoded track version doesn't match the authoritative
     `playback.trackVersion` - protects against acting on stale/superseded
     audio, same principle as the main playback-apply effect.
+  - `canMeasureDrift` (Phase 6) also refuses to run without a genuinely
+    completed clock sync (third param `hasClockSync`, default `true` so all
+    Phase 5 call sites/tests are unaffected) - closes the same 0ms-fallback
+    gap for drift correction that recovery closes for the main playback path.
+- Recovery (Phase 6, `client/src/recoveryState.js` + `Room.jsx`): synchronized
+  playback is never scheduled until FOUR prerequisites all hold -
+  `roomJoined` (this exact connection has a confirmed room membership),
+  `hasLatestState` (an authoritative `playback`/`track` snapshot has been
+  received since the last (re)join), `trackDecoded` (the decoded buffer
+  version matches `track.version`, or vacuously true if there's no track),
+  and `clockSynced` (`getClockOffsetMs() !== null` - a real completed sync,
+  never a 0ms fallback). `arePrerequisitesMet` is the pure gate.
+  - Every `room:update` (including a join/rejoin ack) feeds its `playback`
+    into `recoveryState.js`'s `receivePlaybackState`, which always overwrites
+    whatever was pending - never a queue, so only the newest authoritative
+    state is ever the candidate to apply.
+  - Whenever any prerequisite or the pending state changes, `Room.jsx`'s
+    apply effect calls `tryConsumePending`: if all prerequisites hold and the
+    pending state's version is newer than what was last applied
+    (`isNewerPlaybackVersion`, reused from `playbackEngine.js` - not
+    reimplemented), it's applied via the *same* `schedulePlay`/`schedulePause`
+    Phase 4 established, exactly like a normal play/pause/seek broadcast. A
+    stale/duplicate pending state (not newer) is discarded without applying.
+  - Late join: prerequisites simply start unmet (except `roomJoined`/
+    `hasLatestState`, true immediately from the join ack) and become met one
+    by one (clock sync completes, decode finishes) - no special-cased "late
+    join" code path exists; it's the same mechanism as any other recovery.
+    If the room is playing, the join ack's `playback.anchorServerTime` is
+    already in the past, so `schedulePlay`'s `Math.max(ctx.currentTime, ...)`
+    clamp starts it immediately at the (server-authoritative) extrapolated
+    position. If paused, `schedulePause` on a fresh engine (nothing playing)
+    is a safe no-op - the paused position is simply adopted for display via
+    `state.playback.positionSec`, with no audio ever started.
+  - Reconnect: on the Socket.IO manager's `reconnect` event, `roomJoined`,
+    `hasLatestState`, and `clockSynced` are all explicitly reset to false
+    (guarded against overlapping rejoin attempts via `rejoinInFlightRef`),
+    then `room:join` is re-emitted with the room code/name remembered from
+    the original join (`roomCodeRef`/`myNameRef`, captured once at mount).
+    Diagnostics.jsx already re-syncs the clock on this same event (unchanged
+    from Phase 3); `client/src/clockSync.js` gained a small `onClockSyncResult`
+    pub/sub so `Room.jsx` can react to that completion without duplicating
+    the trigger. If the rejoin ack fails (room genuinely gone), `Room.jsx`
+    logs a warning and calls `onLeave()` to return to the landing screen.
+  - The already-decoded `AudioBuffer` is NOT re-decoded on reconnect (decode
+    doesn't depend on the connection) - only a genuinely new/different track
+    (revealed by the fresh post-reconnect state) triggers the existing decode
+    effect, unchanged from Phase 4.
+- Host reassignment + room cleanup (Phase 6, `server/roomManager.js`): when
+  the current host's socket disconnects (or leaves), `promoteNewHost` picks
+  the remaining client with the lowest `joinedAt` (deterministic - always the
+  same choice given the same membership) and reassigns `room.hostId`; if no
+  one remains, `hostId` becomes `null`. A former host who later reconnects
+  gets a brand-new `socket.id` via a normal `room:join` and is never
+  special-cased back into `hostId` - they return as an ordinary participant.
+  When a room becomes empty, it is NOT deleted immediately: `scheduleRoomCleanup`
+  starts a `.unref()`'d, test-overridable (`setRoomCleanupGraceMsForTesting`)
+  ~30s timer (`ROOM_CLEANUP_GRACE_MS`). A `room:join` for that code during the
+  grace period cancels the timer and restores the room (track/playback state
+  preserved, not reset); if the room was empty, the joiner becomes host. If
+  the timer fires while still empty, the room is deleted, its outstanding
+  upload tokens are purged (`uploadTokens.purgeRoom`), and a registered
+  `onRoomDeleted` listener fires so `server/index.js` can delete the track
+  file - `roomManager.js` itself has no filesystem knowledge.
 
 ## Important decisions
 - Phase 0 PoC lives under `server/public` as plain HTML/JS (no React yet) so
@@ -172,9 +244,12 @@ Phase 5 drift events (`server/driftHandlers.js`, `client/src/driftMonitor.js` + 
   runs cleanly. Revisit only if the team upgrades Node past 20.19/22.12.
 - Room manager is in-memory only (`Map`), matching the "no database" MVP
   constraint. Room codes are 5-char, unambiguous-alphabet, collision-checked.
-- Host disconnect: `hostId` is set to `null` (no auto-promotion). Deliberately
-  minimal — full reassignment/pause policy is Phase 6 scope; documented here
-  so it isn't mistaken for a bug.
+- Host disconnect (Phase 1-5): `hostId` was set to `null` (no auto-promotion) -
+  deliberately minimal pending Phase 6's real policy. Superseded by Phase 6's
+  deterministic longest-connected-member promotion (`promoteNewHost`); see
+  the "Synchronization algorithm" section's "Host reassignment + room
+  cleanup" entry for the current behavior. Left here as a record of the
+  earlier decision, not the current one.
 - Vite dev server proxies `/socket.io` (with `ws: true`), `/api`, and
   `/uploads` to `localhost:3001` so the browser only ever talks to one
   origin; no CORS config needed on the Express server.
@@ -215,12 +290,13 @@ Phase 5 drift events (`server/driftHandlers.js`, `client/src/driftMonitor.js` + 
   RTT readout) - it is never read back to make authoritative decisions.
   Each client independently keeps its own offset for its own scheduling use
   once Phase 4 needs it.
-- Reconnection triggers a re-sync (`socket.io.on('reconnect', ...)`), but a
-  reconnect gets a brand-new `socket.id` and Socket.IO does not auto-rejoin
-  rooms - so post-reconnect, local diagnostics correctly update, but
-  `clock:report` will find no room server-side and no-op (`{ok:false}`)
-  until Phase 6 implements room re-join on reconnect. This is a real gap but
-  intentionally not fixed here (Phase 6 owns reconnection/room-membership).
+- Reconnection triggers a re-sync (`socket.io.on('reconnect', ...)`). A
+  reconnect gets a brand-new `socket.id`, and Socket.IO does not auto-rejoin
+  rooms - Phase 3-5 left this as a known gap (`clock:report` would no-op
+  post-reconnect since the new socket wasn't in any room yet); Phase 6
+  closes it by having `Room.jsx` explicitly re-emit `room:join` on the same
+  `reconnect` event, so by the time diagnostics/drift reporting run again,
+  the new socket is already a confirmed room member.
 - Test suite added at `client/test/` using Node's built-in test runner
   (`node --test`, zero new dependencies): `clockSync.unit.test.mjs` (pure
   filtering/median logic, always runnable) and
@@ -264,6 +340,38 @@ Phase 5 drift events (`server/driftHandlers.js`, `client/src/driftMonitor.js` + 
 - Server test suite added at `server/test/` (`node --test`, matching the
   client's Phase 3 approach): `socket.io-client` added as a devDependency
   (server itself doesn't need it) purely for the integration tests.
+- `isHost` moved from a stored per-client field to a value computed in
+  `toPublicState()`. This is the one place Phase 6 touched genuinely
+  Phase 1-era code, and it's a correctness fix required by host
+  reassignment: a stored `isHost` flag would go stale on every promotion
+  unless painstakingly kept in sync on every client entry; computing it from
+  `room.hostId` at read time makes that entire class of bug structurally
+  impossible.
+- Former-host upload-token rejection is checked lazily, at consumption time
+  (`uploadRoute.js`), not proactively invalidated the instant host changes.
+  Tokens are already single-use and short-lived (30s TTL), so lazy checking
+  fully satisfies "must no longer grant host privileges" without needing to
+  track "all outstanding tokens per socket" for proactive cleanup.
+- The empty-room grace-period timer is `.unref()`'d specifically so it never
+  blocks a live server process from exiting, and its duration is swappable
+  via `setRoomCleanupGraceMsForTesting` specifically so tests don't have to
+  wait 30 real seconds - both are test/ops conveniences, not behavior changes
+  to the ~30s default a real empty room actually gets.
+- Recovery prerequisites are deliberately four SEPARATE named booleans
+  (`roomJoined`, `hasLatestState`, `trackDecoded`, `clockSynced`) even though
+  in this app's actual wiring `roomJoined` and `hasLatestState` currently
+  always become true at the same instant (the join/rejoin ack delivers both
+  "we're a member" and "here's the state" atomically). Kept separate because
+  they're conceptually distinct (spec names them separately), the
+  `recoveryState.js` tests exercise them independently for robustness, and
+  it costs nothing to keep the distinction explicit if the data flow ever
+  changes.
+- The Phase 5 drift-correction and Phase 6 recovery-apply effects in
+  `Room.jsx` are two separate `useEffect`s (not merged into one), consistent
+  with how the codebase has kept "decode," "apply playback," and "measure
+  drift" as separate effects since Phase 4/5 - each has a distinct
+  dependency array and reason to re-run, and merging them would make the
+  dependency array's meaning far less legible.
 - Drift correction is a purely local, per-device self-correction - it does
   NOT call `playback:seek`/round-trip through the server. Drift is inherently
   a per-client phenomenon (each device's own clock/audio-clock relationship
@@ -360,20 +468,40 @@ Phase 5 drift events (`server/driftHandlers.js`, `client/src/driftMonitor.js` + 
   more `playbackEngine.js` anchor-math unit tests, plus 4 server integration
   tests for the report/broadcast/no-room/malformed-payload paths) - 58
   scripted tests total across the whole project, all passing.
+- Phase 6: Prerequisite-driven recovery (`client/src/recoveryState.js`) -
+  late join and Socket.IO reconnect now both go through one mechanism: no
+  synchronized playback is scheduled until room-joined, latest-state,
+  track-decoded, and clock-synced ALL hold, and only the newest pending
+  authoritative state is ever applied (never queued). The 0ms clock-offset
+  fallback for scheduling is removed from the production path - both the
+  main playback-apply effect and drift correction now wait for a genuinely
+  completed sync (`canMeasureDrift` gained a `hasClockSync` gate,
+  default-true so existing Phase 5 call sites/tests are unaffected).
+  `Room.jsx` now rejoins its room automatically on reconnect using the room
+  code/name remembered from the original join, then re-earns each
+  prerequisite before resuming synchronized scheduling. Server-side:
+  deterministic host promotion (longest-connected remaining member,
+  `joinedAt`-based) on host disconnect, with `isHost` now computed from
+  `room.hostId` rather than stored per-client so reassignment can't leave a
+  stale flag; a former host reconnecting returns as an ordinary participant;
+  former-host upload tokens are rejected at consumption time, not just issue
+  time; empty rooms get a `.unref()`'d, test-overridable ~30s grace period
+  before deletion, during which a rejoin cancels cleanup, restores the room
+  (state preserved), and makes the rejoiner host; final deletion purges
+  outstanding upload tokens and deletes the track file via a registered
+  `onRoomDeleted` listener (`roomManager.js` itself has no filesystem
+  knowledge). 36 new scripted tests (13 client unit tests for the recovery
+  state machine, 3 new driftMonitor gate tests, 1 new clockSync pub/sub
+  integration test, 19 server tests across host reassignment/former-host
+  token rejection/room cleanup grace period/duplicate-member prevention/
+  late-join+reconnect data flow) - 94 scripted tests total across the whole
+  project, all passing.
 
 ## Known issues
 - The real app's clock-offset estimate (Phase 3) is robust (9-sample,
   low-RTT/median filtered). The Phase 0 PoC's original single-sample
   estimate still exists untouched in `server/public/client.js`, but that's a
   standalone demo page, not the real app path.
-- No reconnection/late-join state sync yet (a client that refreshes mid-room
-  loses its local view and must rejoin manually) — Phase 6 scope. Note: a
-  fresh join/rejoin DOES already receive the current track in its join ack,
-  so track preload on (re)join works; only playback-position sync is
-  missing, and that doesn't exist yet regardless (Phase 4). Clock sync
-  itself DOES re-run correctly after a Socket.IO reconnect, but the
-  resulting `clock:report` silently no-ops server-side until Phase 6 makes
-  reconnected sockets rejoin their room.
 - Drift measurement/correction (Phase 5) is per-device and local only - it
   does not adjust playback rate (no time-stretching/resampling), does not
   calibrate for hardware/output-device latency, and does not coordinate
@@ -382,31 +510,38 @@ Phase 5 drift events (`server/driftHandlers.js`, `client/src/driftMonitor.js` + 
   `PlaybackControls`'s position display remains cosmetic/independent of the
   actual drift-correction machinery (separate, simpler extrapolation, no
   measurement or correction tied to it).
-- No purpose-built late-join mid-playback synchronization, no reconnect
-  recovery yet — Phase 6. What Phase 4 does handle: a client joining a room
-  where playback is already `'playing'` receives the current `playback`
-  state in its join ack; once it enables audio and finishes decoding, the
-  playback-application effect schedules it correctly - `anchorServerTime` is
-  in the past by then, so Web Audio clamps to `ctx.currentTime` and it just
-  starts immediately at roughly the extrapolated-forward offset (see
-  `getCanonicalPosition`/`schedulePlay`'s `Math.max(ctx.currentTime, ...)`
-  clamps). A command that arrives before this device has decoded the
-  relevant track version is held pending (not dropped) and retried once
-  decode catches up (`decodedVersion` in `Room.jsx`) - this also covers the
-  more common Phase 4 case of a host clicking Play before their own device
-  finishes decoding a just-uploaded track. What's still missing for a truly
-  precise late join: no "seek to the exact current position on join" fast
-  path, so there's a decode-time gap where a joining device is silent while
-  everyone else is already mid-track. Phase 6 is where this gets solved
-  properly.
-- Host disconnect leaves the room hostless rather than promoting another
-  client — deliberate for now, see "Important decisions"; Phase 6 will
-  decide the real policy. Note: this also means uploads pause until a new
-  host exists, since only the host can request an upload token.
-- `server/uploads/` grows by one file per track replacement within a room's
-  lifetime beyond the currently-referenced one only if a room is deleted
-  mid-upload-cycle edge case; normal replace-in-place already cleans up the
-  prior file. Acceptable for MVP (process-lifetime storage, no persistence).
+- Late join still has an inherent decode-time gap: a joining device is
+  silent until it (a) gets the required "Enable Audio" user gesture and (b)
+  finishes downloading/decoding the track - this is unavoidable given the
+  spec's own requirement that a gesture is mandatory and audio can't be
+  scheduled before the buffer exists. Once both are done, Phase 6's
+  prerequisite mechanism schedules it correctly into the current timeline
+  (extrapolated to the right position if playing, adopted silently if
+  paused) - there is no further "fast path" beyond that.
+- The empty-room grace period (`ROOM_CLEANUP_GRACE_MS`, ~30s) and drift/sync
+  timing constants are code-level constants ("configurable" by editing a
+  named value), not live admin/UI knobs - matches how every other tunable in
+  this project (drift threshold, correction cooldown, playback schedule
+  lead) has been handled since Phase 4/5.
+- Duplicate-member prevention after a reconnect is verified for the CLEAN
+  disconnect case (a socket that closes normally, or Socket.IO's own
+  reconnect logic) - the old entry is removed via the server's `disconnect`
+  handler before or as the new one joins, confirmed by
+  `server/test/roomCleanup.test.js`'s repeated-cycle test. A genuinely
+  SILENT network drop (cable pulled, no clean close) can take up to
+  Socket.IO's default ping/pong timeout (tens of seconds) to be detected
+  server-side, during which a fast client-side reconnect could briefly show
+  two entries for the same physical device in the device list. Eliminating
+  that window fully would need persistent per-device session identity
+  (deliberately out of scope - the brief excludes user accounts/persistence,
+  and a device-session system edges toward that); this is a known,
+  documented gap rather than a silent one.
+- `server/uploads/` only grows unboundedly if a room is somehow deleted
+  through a path that bypasses `roomManager.js`'s deletion listener (there
+  isn't one - `leaveRoom`'s grace-period expiry is the only deletion path,
+  and it always fires `onRoomDeleted`). Normal track replacement within a
+  live room already cleans up the prior file (Phase 2), and Phase 6 closed
+  the room-deletion gap that used to leave an orphaned file behind.
 - Multer 1.x was initially installed by mistake (deprecated/vulnerable);
   corrected to Multer `^2.2.0` before first use — no vulnerable version ever
   ran with real uploads enabled.

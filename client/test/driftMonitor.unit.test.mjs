@@ -67,6 +67,27 @@ test('canMeasureDrift is true only when playing AND the decoded track version ma
   assert.equal(canMeasureDrift(playback, 3), true);
 });
 
+// --- Phase 6: no 0ms clock-offset fallback for drift correction either ---
+
+test('canMeasureDrift is false when the device has no completed clock sync', () => {
+  const playback = { status: 'playing', trackVersion: 1 };
+  assert.equal(canMeasureDrift(playback, 1, false), false);
+});
+
+test('canMeasureDrift defaults hasClockSync to true, so pre-Phase-6 call sites are unaffected', () => {
+  const playback = { status: 'playing', trackVersion: 1 };
+  assert.equal(canMeasureDrift(playback, 1), true); // 2-arg call, same as all existing Phase 5 tests
+});
+
+test('canMeasureDrift requires ALL three conditions - playing, matching track, and synced', () => {
+  const playing = { status: 'playing', trackVersion: 1 };
+  const paused = { status: 'paused', trackVersion: 1 };
+  assert.equal(canMeasureDrift(playing, 1, true), true);
+  assert.equal(canMeasureDrift(playing, 1, false), false);
+  assert.equal(canMeasureDrift(playing, 2, true), false);
+  assert.equal(canMeasureDrift(paused, 1, true), false);
+});
+
 // --- threshold boundary ---
 
 test('a drift exactly at the threshold counts as a violation', () => {

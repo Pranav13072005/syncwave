@@ -44,6 +44,15 @@ function createUploadRouter(io) {
       res.status(403).json({ error: 'INVALID_TOKEN' });
       return;
     }
+    // Re-check host status at consumption time, not just issue time: host
+    // ownership can change (Phase 6 reassignment) between when a token was
+    // issued and when the upload actually completes. A former host's token
+    // must not still grant upload access after they're no longer host.
+    const currentRoom = roomManager.getRoom(consumed.roomCode);
+    if (!currentRoom || currentRoom.hostId !== consumed.socketId) {
+      res.status(403).json({ error: 'INVALID_TOKEN' });
+      return;
+    }
 
     upload.single('file')(req, res, (err) => {
       if (err) {

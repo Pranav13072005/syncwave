@@ -1,21 +1,40 @@
 // In-memory room store. No database - rooms live only for the process
 // lifetime, per MVP scope (no persistence required).
-const rooms = new Map(); // roomCode -> { code, hostId, clients, track, readyDevices, playback } - see toPublicState() for the exact shape sent to clients
+const uploadTokens = require('./uploadTokens');
+
+const rooms = new Map(); // roomCode -> { code, hostId, clients, track, readyDevices, playback, emptyingTimer } - see toPublicState() for the exact shape sent to clients
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I ambiguity
 const CODE_LENGTH = 5;
 const PLAYBACK_SCHEDULE_LEAD_MS = 1000; // how far into the future play/pause/seek are scheduled
+let ROOM_CLEANUP_GRACE_MS = 30_000; // how long an empty room survives before being deleted
 
-function makeClientEntry(socketId, name, isHost) {
+// Test-only override so tests don't have to wait 30 real seconds to verify
+// grace-period expiry. Never called from production code paths.
+function setRoomCleanupGraceMsForTesting(ms) {
+  ROOM_CLEANUP_GRACE_MS = ms;
+}
+
+let roomDeletedListener = null;
+
+// Registers a callback invoked with the room object right after it's
+// actually deleted (grace period expired while still empty). Used by
+// index.js to delete the room's uploaded track file - roomManager.js
+// deliberately knows nothing about the filesystem/UPLOAD_DIR.
+function onRoomDeleted(listener) {
+  roomDeletedListener = listener;
+}
+
+function makeClientEntry(socketId, name) {
   return {
     id: socketId,
     name,
-    isHost,
     rtt: null,
     clockOffsetMs: null,
     syncStatus: 'unsynced',
     driftMs: null,
     driftCorrectionCount: 0,
+    joinedAt: Date.now(), // used to deterministically promote the longest-connected member on host disconnect
   };
 }
 
@@ -36,35 +55,87 @@ function createRoom(hostSocketId, hostName) {
   const room = {
     code,
     hostId: hostSocketId,
-    clients: new Map([[hostSocketId, makeClientEntry(hostSocketId, hostName, true)]]),
+    clients: new Map([[hostSocketId, makeClientEntry(hostSocketId, hostName)]]),
     track: null, // { version, originalName, mimeType, size, url, storedFilename, uploadedAt, durationSec? }
     readyDevices: new Set(), // socketIds that have decoded room.track at its current version
     playback: makeDefaultPlayback(),
+    emptyingTimer: null,
   };
   rooms.set(code, room);
   return room;
 }
 
+// Joining a room that's mid-grace-period (empty, pending cleanup) cancels
+// that cleanup and restores it. If the room was empty, the first client to
+// (re)join becomes host - there's no one else to defer to.
 function joinRoom(roomCode, socketId, name) {
   const room = rooms.get(roomCode);
   if (!room) return { error: 'ROOM_NOT_FOUND' };
-  room.clients.set(socketId, makeClientEntry(socketId, name, socketId === room.hostId));
+  const wasEmpty = room.clients.size === 0;
+  if (room.emptyingTimer) {
+    clearTimeout(room.emptyingTimer);
+    room.emptyingTimer = null;
+  }
+  room.clients.set(socketId, makeClientEntry(socketId, name));
+  if (wasEmpty) {
+    room.hostId = socketId;
+  }
   return { room };
 }
 
-// Removes a socket from whatever room it's in. If it was the host, the room
-// is left hostless (null) rather than auto-promoting - see PROJECT_CONTEXT
-// "Known issues": deliberate reassignment/pause policy is Phase 6 scope.
-// Returns the affected room (possibly deleted if now empty), or null if the
-// socket wasn't in any room.
+// Deterministically promotes the longest-connected remaining client (lowest
+// joinedAt) to host, or clears hostId if no one remains.
+function promoteNewHost(room) {
+  let longestConnected = null;
+  for (const client of room.clients.values()) {
+    if (!longestConnected || client.joinedAt < longestConnected.joinedAt) {
+      longestConnected = client;
+    }
+  }
+  room.hostId = longestConnected ? longestConnected.id : null;
+}
+
+// Starts (or no-ops if already running) the grace-period cleanup timer for
+// an empty room. unref()'d so a live server process can still exit cleanly
+// and so test runs don't hang waiting on it.
+function scheduleRoomCleanup(room) {
+  if (room.emptyingTimer) return;
+  const timer = setTimeout(() => {
+    room.emptyingTimer = null;
+    // Re-check both conditions: someone may have rejoined (joinRoom already
+    // clears emptyingTimer in that case, but this guards any other race),
+    // and the room might already be a *different* object at this code if a
+    // same-named room code were ever reused (defensive, not expected).
+    if (room.clients.size === 0 && rooms.get(room.code) === room) {
+      rooms.delete(room.code);
+      uploadTokens.purgeRoom(room.code);
+      roomDeletedListener?.(room);
+    }
+  }, ROOM_CLEANUP_GRACE_MS);
+  timer.unref?.();
+  room.emptyingTimer = timer;
+}
+
+function isPendingCleanup(room) {
+  return !!(room && room.emptyingTimer);
+}
+
+// Removes a socket from whatever room it's in. If it was the host, a new
+// host is deterministically promoted (longest-connected remaining member) -
+// see promoteNewHost. If the room becomes empty, cleanup is scheduled with a
+// grace period rather than deleting immediately (see scheduleRoomCleanup).
+// Returns the affected room (for broadcasting), or null if the socket wasn't
+// in any room, or if the room is now empty (nothing left to broadcast to).
 function leaveRoom(socketId) {
   for (const room of rooms.values()) {
     if (room.clients.has(socketId)) {
       room.clients.delete(socketId);
       room.readyDevices.delete(socketId);
-      if (room.hostId === socketId) room.hostId = null;
+      if (room.hostId === socketId) {
+        promoteNewHost(room);
+      }
       if (room.clients.size === 0) {
-        rooms.delete(room.code);
+        scheduleRoomCleanup(room);
         return null;
       }
       return room;
@@ -211,6 +282,9 @@ function updatePlaybackDiagnostics(socketId, { driftMs, correctionCount }) {
   return room;
 }
 
+// isHost is computed here (not stored per-client) so host reassignment
+// (Phase 6) can never leave a stale isHost flag lying around on some other
+// client entry - there is exactly one source of truth, room.hostId.
 function toPublicState(room) {
   return {
     roomCode: room.code,
@@ -219,6 +293,7 @@ function toPublicState(room) {
     playback: room.playback,
     clients: Array.from(room.clients.values()).map((c) => ({
       ...c,
+      isHost: c.id === room.hostId,
       isReady: room.readyDevices.has(c.id),
     })),
   };
@@ -239,4 +314,7 @@ module.exports = {
   issuePauseCommand,
   issueSeekCommand,
   toPublicState,
+  isPendingCleanup,
+  onRoomDeleted,
+  setRoomCleanupGraceMsForTesting,
 };

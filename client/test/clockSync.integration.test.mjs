@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { io } from 'socket.io-client';
-import { runClockSync } from '../src/clockSync.js';
+import { runClockSync, onClockSyncResult } from '../src/clockSync.js';
 
 const BASE = process.env.SYNCWAVE_SERVER_URL || 'http://localhost:3001';
 
@@ -97,6 +97,22 @@ test('clock:report updates room state and is visible to other room members', asy
   assert.equal(guestEntry.syncStatus, 'synced');
   assert.equal(typeof guestEntry.rtt, 'number');
   assert.equal(typeof guestEntry.clockOffsetMs, 'number');
+});
+
+test('onClockSyncResult subscribers are notified when a sync round completes (Phase 6 reactivity)', async (t) => {
+  const socket = io(BASE);
+  t.after(() => socket.close());
+  await waitConnected(socket);
+
+  let notifiedResult = null;
+  const unsubscribe = onClockSyncResult((result) => {
+    notifiedResult = result;
+  });
+  t.after(unsubscribe);
+
+  const result = await runClockSync(socket, { sampleCount: 3 });
+  assert.equal(notifiedResult, result, 'the subscriber must receive the exact same result runClockSync returned');
+  assert.equal(notifiedResult.status, 'synced');
 });
 
 test('clock:report from a socket not in any room no-ops gracefully', async (t) => {

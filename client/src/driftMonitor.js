@@ -27,13 +27,18 @@ export function computeDriftMs(actualPositionSec, expectedPositionSec) {
 }
 
 // Pure gate: is it even meaningful to measure/correct drift right now?
-// False while paused, or while this device hasn't decoded the track version
-// the authoritative state currently applies to (protects against acting on
+// False while paused, while this device hasn't decoded the track version the
+// authoritative state currently applies to (protects against acting on
 // stale/superseded audio - see "Preserve playback/track versions" in the
-// Phase 5 requirements).
-export function canMeasureDrift(playback, decodedTrackVersion) {
+// Phase 5 requirements), or (Phase 6) while this device has no completed
+// clock sync - correction schedules real Web Audio operations from an
+// offset, and a 0ms fallback there would be exactly the "production
+// reliance on a 0ms fallback for synchronized execution" Phase 6 removes.
+// Defaults to true so all pre-Phase-6 call sites/tests are unaffected.
+export function canMeasureDrift(playback, decodedTrackVersion, hasClockSync = true) {
   if (!playback || playback.status !== 'playing') return false;
   if (decodedTrackVersion == null || decodedTrackVersion !== playback.trackVersion) return false;
+  if (!hasClockSync) return false;
   return true;
 }
 

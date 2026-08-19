@@ -59,20 +59,39 @@
   reported to server via `playback:driftReport`
   (`server/driftHandlers.js`). 27 new scripted tests (20 drift-monitor unit +
   3 playback-engine anchor unit + 4 server integration) - 58 total across the
-  project, all passing. Two-device audio drift verification not yet done by
-  the devs (needs real induced drift, e.g. via DevTools throttling - see
-  verification steps in chat).
+  project, all passing. Manually verified in-browser by the devs.
+- Phase 6: Prerequisite-driven recovery (`client/src/recoveryState.js`) - one
+  mechanism now covers both late join and Socket.IO reconnect: nothing is
+  scheduled until room-joined + latest-state + track-decoded + clock-synced
+  ALL hold, and only the newest pending authoritative state is ever applied
+  (never queued). The 0ms clock-offset fallback is removed from the
+  production scheduling path (main playback apply AND drift correction both
+  now wait for a real completed sync). `Room.jsx` auto-rejoins on reconnect
+  using the remembered room code/name. Server: deterministic host promotion
+  (longest-connected remaining member) on host disconnect; `isHost` now
+  computed from `room.hostId` (was a stale-prone stored field); a former
+  host reconnecting returns as an ordinary participant, and their old upload
+  token is rejected at consumption time if host ownership changed;
+  empty rooms get a `.unref()`'d ~30s grace period before deletion (rejoin
+  cancels it and restores the room, making the rejoiner host), with final
+  deletion purging upload tokens and the track file. 36 new scripted tests
+  (13 recovery-state unit + 3 driftMonitor gate + 1 clockSync pub/sub +
+  19 server: host reassignment, former-host token rejection, room cleanup
+  grace period, duplicate-member prevention, late-join/reconnect data flow) -
+  94 scripted tests total across the whole project, all passing. Real
+  multi-device (laptop/phone) manual verification not yet done by the devs.
 
 ## CURRENT
-- Awaiting manual two-device browser verification of Phase 5 (see checklist
-  in chat: diagnostics panel shows live drift/correction count while
-  playing, induced drift via CPU/network throttling triggers a visible
-  correction after 2 consecutive violations, corrections stop within a
-  cooldown window, nothing happens while paused), then start Phase 6: late
-  join, reconnect handling, host-disconnect behavior.
+- Awaiting manual laptop/phone verification of Phase 6 (see checklist in
+  chat: late join mid-playback adopts the current position, late join while
+  paused stays silent at the right position, killing/restoring Wi-Fi on one
+  device triggers automatic rejoin + resync, host disconnect promotes
+  another device and the old host returns as a normal participant on
+  reconnect, an empty room survives a quick rejoin but is gone after ~30s),
+  then start Phase 7: benchmarks, automated tests, error handling, README,
+  UI polish.
 
 ## NEXT
-- Phase 6: Late join, reconnect handling, host-disconnect behavior.
 - Phase 7: Benchmarks, automated tests, error handling, README, UI polish.
 
 ## OPTIONAL
