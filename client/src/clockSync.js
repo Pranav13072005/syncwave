@@ -40,6 +40,16 @@ export function computeRobustEstimate(samples) {
 let lastKnownOffsetMs = null;
 let lastSyncStatus = 'idle';
 
+// Phase 6.2A.1: a monotonic generation counter guarding against two
+// overlapping runClockSync() calls (e.g. the mount-triggered sync still
+// in flight when a reconnect fires another one) racing to write the
+// module-level result. Each call captures its own generation at start;
+// only the call whose generation is still the LATEST when it finishes is
+// allowed to update lastKnownOffsetMs/lastSyncStatus/notify listeners - an
+// older call finishing late (its result is real, but superseded) is
+// silently discarded rather than overwriting a newer, already-applied one.
+let syncGeneration = 0;
+
 export function getClockOffsetMs() {
   return lastKnownOffsetMs;
 }
@@ -87,6 +97,7 @@ export async function runClockSync(socket, {
   interSampleDelayMs = DEFAULT_INTER_SAMPLE_DELAY_MS,
   onSample,
 } = {}) {
+  const myGeneration = ++syncGeneration;
   const samples = [];
   for (let i = 0; i < sampleCount; i++) {
     try {
@@ -101,8 +112,11 @@ export async function runClockSync(socket, {
     }
   }
   const result = computeRobustEstimate(samples);
-  lastKnownOffsetMs = result.offsetMs;
-  lastSyncStatus = result.status;
-  resultListeners.forEach((listener) => listener(result));
+  if (myGeneration === syncGeneration) {
+    // Still the latest call - a newer one hasn't started since this began.
+    lastKnownOffsetMs = result.offsetMs;
+    lastSyncStatus = result.status;
+    resultListeners.forEach((listener) => listener(result));
+  }
   return result;
 }

@@ -11,7 +11,10 @@ const uploadTokens = require('./uploadTokens');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25MB - generous for MP3/WAV demo tracks
+// Phase 7 production-config cleanup: overridable via UPLOAD_MAX_FILE_SIZE_MB
+// (e.g. a smaller limit for a constrained deployment), defaulting to the
+// same 25MB every previous phase has used.
+const MAX_FILE_SIZE_BYTES = (Number(process.env.UPLOAD_MAX_FILE_SIZE_MB) || 25) * 1024 * 1024;
 const ALLOWED_EXTENSIONS = new Set(['.mp3', '.wav']);
 
 const storage = multer.diskStorage({
@@ -44,12 +47,13 @@ function createUploadRouter(io) {
       res.status(403).json({ error: 'INVALID_TOKEN' });
       return;
     }
-    // Re-check host status at consumption time, not just issue time: host
-    // ownership can change (Phase 6 reassignment) between when a token was
-    // issued and when the upload actually completes. A former host's token
-    // must not still grant upload access after they're no longer host.
+    // Re-check role status at consumption time, not just issue time: host/
+    // co-host status can change (Phase 6 reassignment, Phase 6.2B promote/
+    // demote/transfer) between when a token was issued and when the upload
+    // actually completes. A token issued to a former host or a since-demoted
+    // co-host must not still grant upload access.
     const currentRoom = roomManager.getRoom(consumed.roomCode);
-    if (!currentRoom || currentRoom.hostId !== consumed.socketId) {
+    if (!currentRoom || (currentRoom.hostId !== consumed.socketId && !currentRoom.coHostIds.has(consumed.socketId))) {
       res.status(403).json({ error: 'INVALID_TOKEN' });
       return;
     }

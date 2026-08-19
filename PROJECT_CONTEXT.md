@@ -26,6 +26,7 @@ persistence). Current shape:
 ```
 {
   code, hostId,
+  coHostIds: Set<socketId>,  // Phase 6.2B: delegated control (play/pause/seek/next/queue), distinct from the single primary hostId
   clients: Map<socketId, {id, name, rtt, clockOffsetMs, syncStatus, driftMs, driftCorrectionCount, joinedAt}>,
   track: null | { trackId, version, originalName, mimeType, size, url, storedFilename, uploadedAt, durationSec? },
   queue: [{ trackId, originalName, mimeType, size, url, storedFilename, uploadedAt, durationSec? }, ...],  // queue[0] is the immediate-next preload candidate
@@ -53,6 +54,16 @@ it's computed in `toPublicState()` as `c.id === room.hostId`, so host
 reassignment can never leave a stale flag on some other client. `joinedAt`
 (Phase 6, `Date.now()` at join time) is used to deterministically pick the
 longest-connected remaining member to promote on host disconnect.
+`isCoHost` (Phase 6.2B, same pattern) is likewise computed, never stored -
+`c.id === room.hostId ? computed isHost : room.coHostIds.has(c.id)`. Role
+management (`promoteToCoHost`/`demoteToParticipant`/`transferPrimaryHost` in
+`roomManager.js`) is primary-host-only, enforced by `socketUtils.js`'s
+`requireHost` (strict, primary-only) vs. `requireController` (primary OR
+co-host - used for playback/queue commands, which co-hosts may issue).
+Host-disconnect failover (`promoteNewHost`) now prefers the longest-connected
+remaining CO-HOST, falling back to the longest-connected member of any role
+only if no co-host remains - with zero co-hosts ever created (every
+pre-Phase-6.2B room), this is identical to the original rule.
 `driftMs`/`driftCorrectionCount` (Phase 5) default `null`/`0` until the client
 reports a drift measurement via `playback:driftReport` - purely informational,
 same policy as `rtt`/`clockOffsetMs`.
@@ -114,6 +125,15 @@ Phase 6.2A queue events (`server/queueHandlers.js`, `client/src/components/Queue
 - `queue:next` (client→server, ack) - no payload. Host-only. Rejects `QUEUE_EMPTY` (current playback left completely undisturbed) if nothing is queued; otherwise atomically shifts `queue[0]` into `room.track` and starts it playing from `positionSec: 0` at a future `anchorServerTime` - the same `PLAYBACK_SCHEDULE_LEAD_MS` (1000ms) lead every other playback command uses, not a new constant.
 - `queue:trackReady` (client→server, ack) - `{ trackId, durationSec }` in; only accepted if `trackId` matches `queue[0]` EXACTLY right now (a report for any other track - stale after a reorder/removal/advance - is silently ignored, mirroring `track:ready`'s version check). On success, adds the socket to `nextReadyDevices` and stores `durationSec` on the queue item so it carries forward into `room.track.durationSec` (arming the end timer immediately) if/when this track becomes current before a fresh `track:ready` arrives.
 - All four broadcast the updated state via the existing `room:update` (not a new event), same as every other room-state change since Phase 1. `toPublicState` now also includes `queue`, and each client entry gains `isNextReady` (mirrors the existing `isReady`).
+
+Phase 6.2A.1 reliability fixes (no new socket events - client-only fixes, see the Synchronization algorithm section below for the mechanisms):
+- `playback:play`/`pause`/`seek` and `queue:next`/`remove`/`reorder` now authorize via `requireController` (primary host OR co-host) instead of the old `requireHost` (primary-only) - a forward-looking change made alongside the co-host work in the same pass, since both touched the same authorization layer.
+
+Phase 6.2B role events (`server/roleHandlers.js`, PRIMARY-HOST-ONLY - `requireHost`, not `requireController`):
+- `room:promoteCoHost` (client→server, ack) - `{ targetSocketId }` in. Adds the target to `coHostIds`; ack `{ ok: false, error: 'NOT_HOST' | 'NO_ROOM' | 'TARGET_NOT_IN_ROOM' | 'ALREADY_PRIMARY_HOST' }` on rejection.
+- `room:demoteCoHost` (client→server, ack) - `{ targetSocketId }` in. Removes the target from `coHostIds` (no-op, not an error, if they weren't a co-host).
+- `room:transferHost` (client→server, ack) - `{ targetSocketId }` in. Sets `hostId` to the target and adds the OLD `hostId` to `coHostIds` (voluntary transfer makes the outgoing primary a co-host, not a plain participant, for room continuity); ack error `'ALREADY_PRIMARY_HOST'` if transferring to yourself.
+- All three broadcast `room:update`. Upload-token consumption (`uploadRoute.js`) and `track:requestUploadToken` (`trackHandlers.js`) both re-check `hostId === socketId || coHostIds.has(socketId)` at the moment of use, not just at issue time - a co-host demoted (or a host who transferred away) between requesting a token and consuming it loses upload rights immediately, reusing the exact lazy-recheck pattern Phase 6 established for former hosts.
 
 ## Synchronization algorithm (current state)
 - Clock offset (Phase 3, `client/src/clockSync.js`): 9 sequential Cristian's-
@@ -336,6 +356,117 @@ Phase 6.2A queue events (`server/queueHandlers.js`, `client/src/components/Queue
     stopping and the server's completion broadcast arriving, during which
     `getActualPositionSec()` would otherwise keep extrapolating past the
     real (stopped) position.
+- Queue + preload + synchronized transitions (Phase 6.2A, `server/roomManager.js`'s
+  `addToQueue`/`removeFromQueue`/`reorderQueue`/`setNextReady`/`advanceToNextTrack`/
+  `issueNextCommand`, `client/src/components/Room.jsx`'s next-track preload effect):
+  - A manual Next and an automatic advance (queue non-empty at natural completion)
+    are the SAME operation, `advanceToNextTrack`: cancel the old track's end timer,
+    shift `queue[0]` into `room.track` (a track replacement exactly like `setTrack` -
+    bumps `track.version`, clears `readyDevices`), start it playing from `positionSec: 0`
+    at `Date.now() + PLAYBACK_SCHEDULE_LEAD_MS`, then call `scheduleEndTimer` again for
+    the new track. Reusing the *same* 1000ms lead every other playback command uses
+    (rather than a separate "transition" lead) means a track-to-track transition
+    involves a short broadcast-scheduling gap rather than sample-perfect gapless
+    playback - deliberately out of scope per the brief ("a short controlled transition
+    is acceptable; correct synchronization is more important than zero-gap playback").
+  - `completeNaturalPlayback` (the Phase 6.1 end-timer callback) now branches on
+    `room.queue.length`: empty -> the unchanged Phase 6.1 behavior (pause at
+    `positionSec === durationSec`); non-empty -> one `advanceToNextTrack` call, so a
+    queued room never broadcasts a permanent paused-at-end state before flowing into
+    the next track. Because `advanceToNextTrack` itself calls `scheduleEndTimer` again,
+    the completion chain advances through an arbitrarily long queue with zero extra
+    bookkeeping - each track's end timer simply schedules the next one.
+  - Stale-timer/stale-track protection is entirely the *existing* Phase 6.1 mechanism,
+    unmodified: `scheduleEndTimer` still captures `playback.version`/`track.version` in
+    its closure and re-validates both (plus room identity and `status === 'playing'`)
+    when it fires. A track that already advanced via manual Next bumped both versions,
+    so the OLD track's stale timer (if it was still pending) is automatically a no-op -
+    no queue-specific version check was needed.
+  - Client-side, a track advance requires ZERO new scheduling code: `advanceToNextTrack`
+    produces an ordinary `{track, playback}` update shape (same as any track replacement
+    + immediate play), so the *existing* Phase 6 recovery/apply effect in `Room.jsx`
+    (`tryConsumePending` + `schedulePlay`) handles it automatically once `decodedVersion`
+    matches the new `track.version`. This is also why "an unready device stays silent and
+    recovers once decoded" (the spec's required MVP policy for a slow next-track
+    preload) needed no new code either - it's exactly the existing `trackDecoded`
+    prerequisite gate, which already keeps `toApply` `null` until decode catches up, at
+    which point `computeExpectedPositionSec` naturally computes the real elapsed
+    position into the new track rather than 0.
+  - Client-side preload (`Room.jsx`): a SEPARATE `useEffect`, declared after the
+    current-track decode effect (current-track recovery takes priority per the spec),
+    decodes ONLY `state.queue?.[0]` into a second ref (`nextBufferRef`, distinct from
+    `bufferRef`) and reports `queue:trackReady`. When that same track later becomes
+    current, the current-track decode effect checks `nextBufferRef.current.trackId`
+    first and PROMOTES the already-decoded buffer (no re-download/re-decode) if it
+    matches exactly - the same identity-match discipline the server applies to
+    `setNextReady`. A preload failure is non-fatal (logged, not surfaced as a blocking
+    UI error) - the device just falls back to a normal decode once the track actually
+    becomes current, same recovery path as any late-decoding device.
+  - Next-track readiness (`nextReadyDevices`) is informational only - `issueNextCommand`
+    never checks it before transitioning (the spec's deterministic MVP policy: the
+    server always transitions authoritatively regardless of per-device readiness). It's
+    cleared whenever `queue[0]`'s `trackId` identity changes (add-to-empty-queue,
+    remove-of-queue[0], a reorder that changes the front, or an advance) and left alone
+    otherwise (e.g. appending to the back of a non-empty queue), reusing the exact
+    Set-based staleness pattern `readyDevices`/`track:ready` already established.
+- Multi-device join reliability + stale-source retirement (Phase 6.2A.1,
+  `client/src/clockSync.js`, `client/src/audioEngine.js`,
+  `client/src/playbackEngine.js`, `client/src/components/Room.jsx`,
+  `client/src/components/Diagnostics.jsx`): real multi-device testing found
+  two problems, investigated per the brief before any code changed.
+  - Investigation finding: every scheduling-relevant `useEffect` in
+    `Room.jsx` was ALREADY keyed on primitive fields (`state.track?.version`,
+    `state.playback?.version`, `state.queue?.[0]?.trackId`), not the whole
+    `state` object - so a membership-only `room:update` (someone else
+    joining/leaving) does NOT, by itself, re-trigger decode/recovery/drift
+    effects; React's dependency-array shallow-equality already prevents that.
+    The actual join-burst slowdown traces to real ASYNC RACES, not
+    accidental effect re-runs: (a) `handleUpdate` unconditionally called
+    `receivePlaybackState` on every broadcast, marking a value-identical
+    "pending" entry even when nothing changed - wasteful, not incorrect
+    (`tryConsumePending`'s existing version check discarded it), but now
+    guarded by a `lastSeenPlaybackVersionRef` version comparison so it's a
+    true no-op; (b) `runClockSync` had no protection against two overlapping
+    calls (e.g. mount-triggered sync still running when a reconnect fires
+    another) - whichever finished LAST would win regardless of which
+    STARTED last, capable of overwriting a newer offset with a stale one.
+  - Fix: `clockSync.js` gained a monotonic `syncGeneration` counter - each
+    `runClockSync` call captures its own generation at start and only
+    applies its result if it's still the latest when it finishes, so an
+    older call finishing late can never overwrite a newer one.
+    `Diagnostics.jsx` additionally gained a `syncInFlightRef` guard so two
+    calls from the SAME component never both run a full 9-sample round
+    concurrently in the first place. `audioEngine.js`'s `decodeTrackFromUrl`
+    gained an in-flight-promise cache keyed by url, deduping concurrent
+    decode requests for the same file (e.g. a StrictMode double-invoke, or
+    the current-track and next-track preload effects happening to target the
+    same URL). `recoveryState.js`'s local scheduling lead
+    (`RECOVERY_SCHEDULING_LEAD_MS`) was raised from 150ms to 300ms - real
+    testing found 150ms too tight for a device also under load finishing a
+    decode/clock-sync; still far short of the ~1000ms room-wide command lead,
+    which is untouched.
+  - Issue 2 (stale old-track playback on an unready Next client): root cause
+    was that the recovery-apply effect's "not decoded yet" branch just
+    logged a warning and returned - it never called `schedulePause`, so an
+    unready device's OLD source kept playing indefinitely, since nothing
+    ever told it to stop. Fixed by separating "retire the stale source" from
+    "start the new one": `playbackEngine.js` now tracks
+    `currentTrackVersion` alongside `currentSource`/`currentAnchor`
+    (`getCurrentTrackVersion()`, set by every `schedulePlay` call, cleared by
+    `schedulePause`/`onended`/`resetPlaybackEngine`), and `Room.jsx` gained a
+    SEPARATE effect (declared after the recovery-apply effect, so a ready
+    device's own `schedulePlay` call already updated
+    `getCurrentTrackVersion()` before this one evaluates) that compares it
+    against `playback.trackVersion` and calls `schedulePause` whenever they
+    differ - REGARDLESS of whether this device has decoded the new track.
+    Starting the new track remains fully gated on `trackDecoded` via the
+    unchanged recovery-prerequisite mechanism; only STOPPING the old one was
+    ever incorrectly coupled to buffer readiness. Applies identically to
+    manual Next and automatic advance (both produce the same
+    `{track, playback}` shape via `advanceToNextTrack`), and drift correction
+    was already safe without any change (`canMeasureDrift`'s existing
+    decoded-track-version check already refuses to act on a track this
+    device hasn't decoded).
 
 ## Important decisions
 - Phase 0 PoC lives under `server/public` as plain HTML/JS (no React yet) so
@@ -561,6 +692,63 @@ Phase 6.2A queue events (`server/queueHandlers.js`, `client/src/components/Queue
   that don't touch `queue[0]`) don't bump either since they don't touch
   current track/playback state - see "Queue + preload + synchronized
   transitions" above.
+- Co-host design (Phase 6.2B): considered a flat `Set<socketId>` of "hosts"
+  with no primary/secondary distinction, rejected per the brief's explicit
+  "do NOT create several equal room owners" - promote/demote/transfer must
+  have exactly one authority, so `hostId` (single) + `coHostIds` (delegated,
+  broader) stayed structurally separate, with two authorization checks
+  (`requireHost` strict-primary, `requireController` primary-or-co-host)
+  rather than one flag with runtime role branching.
+- Voluntary transfer makes the OLD primary a CO-HOST, not a plain
+  participant - explicit in the brief ("gives intuitive room continuity"),
+  and reuses the exact same `coHostIds` mechanism rather than inventing a
+  "former host" concept.
+- Failover (disconnect, not voluntary transfer) prefers a co-host over an
+  earlier-joined plain participant - a co-host already has demonstrated
+  delegated trust, so continuity of control matters more than raw
+  connection order there. Explicit transfer and failover are still two
+  separate code paths (`transferPrimaryHost` vs `promoteNewHost`) since
+  their trigger and old-primary's resulting role differ (co-host on
+  voluntary transfer; the OLD primary keeps no special role at all after an
+  involuntary failover - see Room-state model above).
+- Local volume routes every `AudioBufferSourceNode` through one persistent
+  `GainNode` (created once, never recreated) rather than setting `.gain` per
+  source - sources are recreated on every Play/Seek/drift-correction/Next,
+  but the gain node (and therefore the user's chosen volume) must survive
+  that churn without being reset each time.
+- Calibration is applied ONLY in `playbackEngine.js`'s live `scheduleTimeFor`
+  wrapper, added to the network clock offset right before the pure/tested
+  `computeAudioContextStartTime` call - never inside that pure function
+  itself. Keeps the well-tested clock-conversion formula completely
+  unmodified and keeps calibration structurally impossible to confuse with
+  the Phase 3 network offset, even though both end up added together at the
+  same call site.
+- Invite links (`/room/<CODE>`) use a ~15-line regex + `history.pushState`
+  in `App.jsx` instead of adding `react-router` - this app has exactly two
+  "pages" (Landing/Room), so a full router dependency for one feature would
+  be disproportionate. A direct page load on `/room/<CODE>` is served by
+  Vite's dev-server SPA fallback in local development; wiring the same
+  fallback into a production static-file server is a deployment step, not
+  automated by this client-only app (see README's "Running locally").
+- The Phase 7 benchmark facility (`client/src/benchmark.js`) stores its
+  aggregation state at module scope (like `clockSync.js`'s cached offset),
+  not threaded through React state/props - it's fed from several unrelated
+  call sites (drift ticks, recovery-apply completions) that shouldn't each
+  need to know a `BenchmarkPanel` exists, and the panel itself just polls the
+  snapshot on a 1s interval rather than subscribing.
+- Duplicated Socket.IO integration-test helpers (`waitConnected`/`emitAck`/
+  `waitForRoomUpdate`/`uploadTrack`, near-identically copy-pasted into most
+  of `server/test/*.integration-style` files) were extracted into
+  `server/testUtils.js` (Phase 7 code-quality pass) - deliberately placed
+  OUTSIDE `server/test/`, since Node's default test-file discovery sweeps up
+  any `.js` file inside a directory literally named `test`, which would
+  otherwise make a pure helper module show up as a phantom zero-assertion
+  "test". Adopted in the three newest integration files
+  (`queueIntegration.test.js`, `reliability.test.js`,
+  `roleIntegration.test.js`); the older pre-existing integration files keep
+  their own local copies rather than being touched for this - a deliberate,
+  narrower scope than a full repo-wide sweep, per "do not perform a broad
+  rewrite" on already-verified suites.
 
 ## Completed features
 - Phase 0: Socket.IO connection between server and multiple clients; shared
@@ -738,6 +926,86 @@ Phase 6.2A queue events (`server/queueHandlers.js`, `client/src/components/Queue
   mutation/readiness/transition broadcasts, host-only rejection, and on-disk
   file cleanup) - 153 scripted tests total across the whole project, all
   passing.
+- Phase 6.2A.1 reliability fixes: real multi-device testing found (1) join
+  bursts of several devices making synchronization noticeably slower/some
+  devices settling late, and (2) a device that hadn't preloaded the next
+  track kept playing the OLD track after Next instead of going silent.
+  Investigated first per the brief: `Room.jsx`'s scheduling-relevant effects
+  were already keyed on primitive version fields (not the whole `state`
+  object), so membership-only updates were never accidentally re-triggering
+  decode/recovery/drift - the real issues were async races. Fixed: a
+  monotonic generation guard in `clockSync.js`'s `runClockSync` so an older,
+  slower-finishing sync call can never overwrite a newer one's result; an
+  in-flight guard in `Diagnostics.jsx` preventing two overlapping sync
+  rounds from the same component; an in-flight decode-promise cache keyed by
+  url in `audioEngine.js`; `recoveryState.js`'s local scheduling lead raised
+  150ms -> 300ms for more headroom on loaded mobile devices; a
+  `lastSeenPlaybackVersionRef` guard so a membership-only broadcast doesn't
+  even mark a redundant pending recovery entry. For the stale-track bug:
+  `playbackEngine.js` now tracks `currentTrackVersion` alongside the active
+  source (`getCurrentTrackVersion()`), and `Room.jsx` gained a dedicated
+  effect that retires (stops) a locally-playing source the moment
+  `playback.trackVersion` moves on, REGARDLESS of whether this device has
+  decoded the new track yet - decoupling "stop the old" from "start the
+  new" (which remains gated on `trackDecoded`, unchanged). 6 new scripted
+  tests (5 direct roomManager tests in `server/test/reliability.test.js` -
+  membership never touches playback/track state (join and leave), a
+  multi-joiner live-server test, and a chained A->B->C stale-state test -
+  plus 1 client-side clock-sync generation-guard integration test) - 159
+  scripted tests total across the whole project, all passing.
+- Phase 6.2B final product features: **Primary Host + Co-hosts** -
+  `room.coHostIds`, promote/demote/transfer (`server/roleHandlers.js`,
+  primary-host-only), playback/queue authorization broadened to
+  primary-OR-co-host (`requireController`), failover preferring a connected
+  co-host, upload-token re-validation extended to co-hosts, `DeviceList.jsx`
+  role badges + primary-only promote/demote/transfer buttons. **Local
+  volume** - a persistent `GainNode` in `playbackEngine.js` surviving source
+  recreation, `LocalSettings.jsx` slider + mute. **Device calibration** -
+  `calibrationOffsetMs` applied only in the live scheduling wrapper (never
+  the pure clock-conversion function), persisted via `calibration.js`
+  (localStorage, fails gracefully without it). **Screen Wake Lock** -
+  `wakeLock.js`, feature-detected, reacquires on visibility change, releases
+  on leave/unmount. **Invite link** - `/room/<CODE>` parsed by `App.jsx`,
+  `InvitePanel.jsx` copy-code/copy-link. **Queue UI polish** - "Now Playing"/
+  "Up Next" headings, compact next-ready readout (pre-existing from Phase
+  6.2A, confirmed still correct). 22 new scripted tests (13 direct
+  role-management unit tests + 4 live-server role integration tests
+  exercising promote/demote/transfer/failover/upload-token-revocation over
+  real sockets, plus 3 client unit tests for the new
+  `getCurrentTrackVersion`/calibration getters and 2 for calibration's
+  localStorage-unavailable fallback) - 181 scripted tests total across the
+  whole project, all passing. Client-side volume/calibration/wake-lock code
+  itself (the actual GainNode/AudioContext/navigator.wakeLock calls) is
+  real-browser-only
+  (same AudioContext/`navigator.wakeLock` limitation as all Web-Audio code
+  since Phase 0) - verified by code inspection + manual testing, not
+  scripted tests, beyond the calibration getter/setter and localStorage
+  fallback pure-logic tests that ARE scripted.
+- Phase 7 final engineering pass: responsive layout reorder (Room
+  name/code/share -> connection/role -> Now Playing -> Playback controls ->
+  Queue -> Devices -> Sync Diagnostics -> Local Device Settings) with a
+  480px-breakpoint mobile stylesheet pass; a top-level `ErrorBoundary`
+  catching unexpected render errors with a generic reload prompt (never a
+  raw stack trace to the user); one real listener-cleanup fix
+  (`InvitePanel.jsx`'s "copied!" timeout wasn't cleared on unmount); env-var
+  overrides for server port/upload-size-limit and the Vite dev-proxy target
+  (`VITE_SERVER_URL`), all with working defaults so local dev stays
+  zero-config; a small development/benchmark facility
+  (`client/src/benchmark.js` + `BenchmarkPanel.jsx`) collecting real
+  join-recovery-time, reconnect-recovery-time, and drift-sample aggregates
+  (mean/median/P95/max absolute drift, correction count) with a "copy report
+  as JSON" action, explicitly never fabricating numbers; duplicated
+  Socket.IO integration-test helpers extracted to `server/testUtils.js`
+  (adopted in the three newest integration files); the Phase 0 PoC page
+  gained an explicit "this is not the app" banner; `docs/benchmarks.md` and
+  `docs/cv-metrics.md` created with `TO_BE_MEASURED` placeholders (no
+  invented numbers); a full README (overview, features, architecture +
+  Mermaid diagrams, sync algorithm, hard problems, queue design, testing,
+  benchmark reference, limitations, running-locally, demo script). 8 new
+  scripted client tests (`client/test/benchmark.unit.test.mjs` - pure
+  aggregation-function coverage for the summarize/record helpers) -
+  **189 scripted tests total across the whole project (110 server + 79
+  client), all passing.**
 
 ## Known issues
 - The real app's clock-offset estimate (Phase 3) is robust (9-sample,
@@ -844,56 +1112,23 @@ Phase 6.2A queue events (`server/queueHandlers.js`, `client/src/components/Queue
   devices that have both enabled audio and finished decoding `queue[0]` -
   same convention as the existing current-track READY badge (a device that
   hasn't clicked "Enable Audio" yet never counts as ready for anything).
-- Queue + preload + synchronized transitions (Phase 6.2A, `server/roomManager.js`'s
-  `addToQueue`/`removeFromQueue`/`reorderQueue`/`setNextReady`/`advanceToNextTrack`/
-  `issueNextCommand`, `client/src/components/Room.jsx`'s next-track preload effect):
-  - A manual Next and an automatic advance (queue non-empty at natural completion)
-    are the SAME operation, `advanceToNextTrack`: cancel the old track's end timer,
-    shift `queue[0]` into `room.track` (a track replacement exactly like `setTrack` -
-    bumps `track.version`, clears `readyDevices`), start it playing from `positionSec: 0`
-    at `Date.now() + PLAYBACK_SCHEDULE_LEAD_MS`, then call `scheduleEndTimer` again for
-    the new track. Reusing the *same* 1000ms lead every other playback command uses
-    (rather than a separate "transition" lead) means a track-to-track transition
-    involves a short broadcast-scheduling gap rather than sample-perfect gapless
-    playback - deliberately out of scope per the brief ("a short controlled transition
-    is acceptable; correct synchronization is more important than zero-gap playback").
-  - `completeNaturalPlayback` (the Phase 6.1 end-timer callback) now branches on
-    `room.queue.length`: empty -> the unchanged Phase 6.1 behavior (pause at
-    `positionSec === durationSec`); non-empty -> one `advanceToNextTrack` call, so a
-    queued room never broadcasts a permanent paused-at-end state before flowing into
-    the next track. Because `advanceToNextTrack` itself calls `scheduleEndTimer` again,
-    the completion chain advances through an arbitrarily long queue with zero extra
-    bookkeeping - each track's end timer simply schedules the next one.
-  - Stale-timer/stale-track protection is entirely the *existing* Phase 6.1 mechanism,
-    unmodified: `scheduleEndTimer` still captures `playback.version`/`track.version` in
-    its closure and re-validates both (plus room identity and `status === 'playing'`)
-    when it fires. A track that already advanced via manual Next bumped both versions,
-    so the OLD track's stale timer (if it was still pending) is automatically a no-op -
-    no queue-specific version check was needed.
-  - Client-side, a track advance requires ZERO new scheduling code: `advanceToNextTrack`
-    produces an ordinary `{track, playback}` update shape (same as any track replacement
-    + immediate play), so the *existing* Phase 6 recovery/apply effect in `Room.jsx`
-    (`tryConsumePending` + `schedulePlay`) handles it automatically once `decodedVersion`
-    matches the new `track.version`. This is also why "an unready device stays silent and
-    recovers once decoded" (the spec's required MVP policy for a slow next-track
-    preload) needed no new code either - it's exactly the existing `trackDecoded`
-    prerequisite gate, which already keeps `toApply` `null` until decode catches up, at
-    which point `computeExpectedPositionSec` naturally computes the real elapsed
-    position into the new track rather than 0.
-  - Client-side preload (`Room.jsx`): a SEPARATE `useEffect`, declared after the
-    current-track decode effect (current-track recovery takes priority per the spec),
-    decodes ONLY `state.queue?.[0]` into a second ref (`nextBufferRef`, distinct from
-    `bufferRef`) and reports `queue:trackReady`. When that same track later becomes
-    current, the current-track decode effect checks `nextBufferRef.current.trackId`
-    first and PROMOTES the already-decoded buffer (no re-download/re-decode) if it
-    matches exactly - the same identity-match discipline the server applies to
-    `setNextReady`. A preload failure is non-fatal (logged, not surfaced as a blocking
-    UI error) - the device just falls back to a normal decode once the track actually
-    becomes current, same recovery path as any late-decoding device.
-  - Next-track readiness (`nextReadyDevices`) is informational only - `issueNextCommand`
-    never checks it before transitioning (the spec's deterministic MVP policy: the
-    server always transitions authoritatively regardless of per-device readiness). It's
-    cleared whenever `queue[0]`'s `trackId` identity changes (add-to-empty-queue,
-    remove-of-queue[0], a reorder that changes the front, or an advance) and left alone
-    otherwise (e.g. appending to the back of a non-empty queue), reusing the exact
-    Set-based staleness pattern `readyDevices`/`track:ready` already established.
+- There is no production static-file pipeline serving the built React client
+  (`client/dist/`, from `npm run build`) from the Express server -
+  `server/index.js` only serves `server/public` (the Phase 0 PoC) and
+  `server/uploads`. Local development (two processes: `npm run dev` in
+  `client/`, `npm start` in `server/`) is fully covered; wiring Express to
+  serve `client/dist` with an SPA fallback for `/room/<code>` is left as an
+  explicit deployment step (see README), not something this MVP automates.
+- `client/`'s pinned `vite@^5.4.11` (see the earlier "React client
+  scaffolded with Vite" decision - `vite@8`'s native binding is broken on
+  this Windows/Node 20.12.2 combination) carries a known `npm audit`
+  advisory (moderate, via a transitive `esbuild` version) affecting only the
+  Vite DEV SERVER accepting cross-origin requests - it does not affect the
+  production build output or the Express server. `npm audit fix --force`
+  would upgrade to the broken `vite@8`, so it's deliberately not applied;
+  revisit alongside the existing "revisit only if the team upgrades Node"
+  note.
+- `docs/benchmarks.md` and `docs/cv-metrics.md` are structure-only as of this
+  writing - every numeric field is `TO_BE_MEASURED`, pending a dedicated
+  real multi-device benchmark session per the procedure documented there.
+  Nothing in this project currently claims a measured drift/recovery number.

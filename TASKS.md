@@ -139,19 +139,76 @@
   readout). 32 new scripted server tests (22 direct roomManager unit tests +
   10 live-server integration tests) - 153 scripted tests total across the
   whole project, all passing.
+- Phase 6.2A.1 reliability fixes: investigated multi-device join slowdown and
+  a stale-old-track-on-unready-Next bug per the brief before changing code.
+  Found `Room.jsx`'s effects were already correctly keyed on primitive
+  version fields (not accidentally re-triggered by membership-only
+  updates) - the real join-burst issue was async races: `clockSync.js`
+  gained a monotonic generation guard so an older, slower `runClockSync`
+  call can never overwrite a newer one's result; `Diagnostics.jsx` gained an
+  in-flight-sync guard; `audioEngine.js`'s `decodeTrackFromUrl` gained an
+  in-flight-promise cache keyed by url; `recoveryState.js`'s local
+  scheduling lead raised 150ms -> 300ms. The stale-track bug: the
+  recovery-apply effect's "not decoded yet" branch never called
+  `schedulePause`, so an unready device's OLD source just kept playing.
+  Fixed by tracking `currentTrackVersion` in `playbackEngine.js`
+  (`getCurrentTrackVersion()`) and adding a separate `Room.jsx` effect that
+  retires a stale source at the authoritative transition instant regardless
+  of buffer readiness - decoupled from starting the new track, which stays
+  gated on `trackDecoded`. 6 new scripted tests - 159 scripted tests total,
+  all passing.
+- Phase 6.2B final product features: Primary Host + Co-hosts
+  (`room.coHostIds`, promote/demote/transfer, failover prefers a co-host,
+  `requireController` broadens playback/queue authorization to
+  primary-or-co-host); local volume (persistent `GainNode`, survives source
+  recreation); device calibration (`calibrationOffsetMs`, separate from
+  network clock offset, localStorage-persisted); Screen Wake Lock
+  (feature-detected, reacquires on visibility change); invite links
+  (`/room/<CODE>`, no router dependency); queue UI polish (Now
+  Playing/Up Next headings). 22 new scripted tests - 181 scripted tests
+  total, all passing.
+- Phase 7 final engineering pass: responsive layout reorder + mobile
+  breakpoint; top-level `ErrorBoundary`; one real listener-cleanup fix
+  (`InvitePanel.jsx`'s copy-confirmation timeout); env-var overrides for
+  server port/upload limit/Vite proxy target, all with working defaults;
+  a development/benchmark facility (`client/src/benchmark.js` +
+  `BenchmarkPanel.jsx`) collecting real join/reconnect recovery times and
+  drift-sample aggregates, never fabricated; duplicated integration-test
+  helpers extracted to `server/testUtils.js`; Phase 0 PoC page labeled more
+  explicitly; `docs/benchmarks.md` + `docs/cv-metrics.md` created with
+  `TO_BE_MEASURED` placeholders only; full README with architecture +
+  sequence Mermaid diagrams. 8 new scripted tests - **189 scripted tests
+  total across the whole project (110 server + 79 client), all passing.**
 
 ## CURRENT
-- Awaiting real laptop/phone verification of the Phase 6.2A queue (see
-  checklist in chat: Test A queue basic, Test B preload, Test C manual Next,
-  Test D auto Next, Test E slow next-track client, Test F reorder, Test G
-  late join with a queue), alongside the still-pending Phase 6.1
-  playback-lifecycle checklist (Tests A-D: natural completion, seek near the
-  end, replay, late join after completion). Do not start the song queue's
-  remaining polish or Phase 7 until these are confirmed.
+**FEATURE COMPLETE — AWAITING FINAL REAL-DEVICE DEBUG/BENCHMARK PASS.**
+
+Everything through Phase 7 is implemented and covered by the automated test
+suite (189/189 passing) and both production builds succeed. Still pending
+before the project can be called fully finished:
+- The full manual real-device verification checklist (see the final report
+  delivered in chat, section E) - normal Play/Pause/Seek, 3+ participants
+  joining, queue, manual/automatic Next, a slow/unready device, late join,
+  airplane-mode disconnect/reconnect, host failover, co-host controls, host
+  transfer, volume, calibration, Wake Lock, track completion/replay.
+- The Phase 6.1/6.2A queue manual verification checklists from the previous
+  rounds (Tests A-D playback lifecycle; Tests A-G queue) remain unconfirmed
+  from a real-device pass and are folded into the consolidated checklist
+  above rather than tracked separately from here on.
+- Running the `docs/benchmarks.md` procedure on real devices and filling in
+  its (currently `TO_BE_MEASURED`) numbers, then updating
+  `docs/cv-metrics.md` from those results.
 
 ## NEXT
-- Phase 7: Benchmarks, automated tests, error handling, README, UI polish.
+- Real-device debugging + benchmark pass (see above). No further feature
+  work is planned per the Phase 7 brief's scope freeze - do not add Spotify/
+  YouTube/Apple Music, WebRTC/peer-to-peer streaming, chat, social profiles,
+  recommendations, an AI DJ, a native mobile app, a database for its own
+  sake, or microservices/Kubernetes.
 
 ## OPTIONAL
 - Playback-rate based drift correction (only after basic correction works).
 - Reconnect/network resilience stress testing across real devices.
+- Wiring a production static-file pipeline (Express serving `client/dist`
+  with an SPA fallback for `/room/<code>`) if/when an actual deployment is
+  needed - not required for local development or the CV/portfolio use case.

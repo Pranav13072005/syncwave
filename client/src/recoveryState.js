@@ -13,9 +13,14 @@ import { computeExpectedPositionSec } from './driftMonitor.js';
 // Local scheduling lead for recovery apply: no network round trip is needed
 // for this per-device decision, just enough lead for Web Audio to schedule
 // reliably (same rationale as driftMonitor.js's correction lead - kept as
-// its own constant so the two can be tuned independently even though they
-// start equal).
-export const RECOVERY_SCHEDULING_LEAD_MS = 150;
+// its own constant so the two can be tuned independently). Raised from an
+// original 150ms to 300ms (Phase 6.2A.1) - real mobile-browser testing with
+// several devices recovering at once found 150ms too tight for a device
+// that's also under load finishing a decode/clock-sync, occasionally
+// missing the scheduled AudioContext start. 300ms sits in the 250-400ms
+// range found reliable without approaching the ~1000ms room-wide command
+// lead (which stays untouched - this is a purely local, per-device value).
+export const RECOVERY_SCHEDULING_LEAD_MS = 300;
 
 export function arePrerequisitesMet({ roomJoined, hasLatestState, trackDecoded, clockSynced }) {
   return !!(roomJoined && hasLatestState && trackDecoded && clockSynced);

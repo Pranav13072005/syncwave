@@ -1,10 +1,11 @@
-export default function DeviceList({ clients, mySocketId }) {
+export default function DeviceList({ clients, mySocketId, isPrimaryHost = false, onPromote, onDemote, onTransfer }) {
   return (
     <ul className="device-list">
       {clients.map((c) => (
         <li key={c.id} className={c.id === mySocketId ? 'device-me' : ''}>
           <span className="device-name">{c.name}</span>
           {c.isHost && <span className="badge badge-host">HOST</span>}
+          {c.isCoHost && <span className="badge badge-cohost">CO-HOST</span>}
           {c.id === mySocketId && <span className="badge badge-you">YOU</span>}
           {c.isReady && <span className="badge badge-ready">READY</span>}
           {typeof c.rtt === 'number' && <span className="device-rtt">RTT {c.rtt.toFixed(0)}ms</span>}
@@ -12,6 +13,16 @@ export default function DeviceList({ clients, mySocketId }) {
             <span className="device-rtt">
               Drift {c.driftMs >= 0 ? '+' : ''}
               {c.driftMs.toFixed(0)}ms
+            </span>
+          )}
+          {isPrimaryHost && c.id !== mySocketId && (
+            <span className="device-role-controls">
+              {c.isCoHost ? (
+                <button onClick={() => onDemote?.(c.id)}>Remove Co-Host</button>
+              ) : (
+                <button onClick={() => onPromote?.(c.id)}>Make Co-Host</button>
+              )}
+              <button onClick={() => onTransfer?.(c.id)}>Transfer Host</button>
             </span>
           )}
         </li>

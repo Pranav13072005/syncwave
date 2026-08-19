@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { socket } from '../socket';
 import { unlockAudioContext, decodeTrackFromUrl } from '../audioEngine';
-import { schedulePlay, schedulePause, resetPlaybackEngine, getActualPositionSec } from '../playbackEngine';
+import { schedulePlay, schedulePause, resetPlaybackEngine, getActualPositionSec, getCurrentTrackVersion } from '../playbackEngine';
 import { getClockOffsetMs, getLastSyncStatus, onClockSyncResult } from '../clockSync';
 import { arePrerequisitesMet, createInitialRecoveryState, receivePlaybackState, tryConsumePending } from '../recoveryState';
 import {
@@ -18,6 +18,10 @@ import TrackPanel from './TrackPanel';
 import QueuePanel from './QueuePanel';
 import Diagnostics from './Diagnostics';
 import PlaybackControls from './PlaybackControls';
+import LocalSettings from './LocalSettings';
+import InvitePanel from './InvitePanel';
+import BenchmarkPanel from './BenchmarkPanel';
+import { recordDriftSampleGlobal, recordCorrectionGlobal, recordJoinRecoveryGlobal, recordReconnectRecoveryGlobal } from '../benchmark';
 
 const STATUS_LABELS = {
   idle: 'Waiting for track',
@@ -54,6 +58,26 @@ export default function Room({ initialState, onLeave }) {
   const roomCodeRef = useRef(initialState.roomCode); // remembered for reconnect rejoin - room code never changes for this session
   const myNameRef = useRef(initialState.clients.find((c) => c.id === socket.id)?.name || 'Device');
   const rejoinInFlightRef = useRef(false);
+  // Phase 7 benchmark facility - see benchmark.js for the exact measurement
+  // boundaries. mountTimeRef anchors join-recovery-time; reconnectStartTimeRef
+  // anchors reconnect-recovery-time (null except while a reconnect recovery
+  // is in progress); joinRecoveryRecordedRef ensures only the first-ever
+  // recovery completion counts as "join" (later ones close a reconnect
+  // window instead).
+  const mountTimeRef = useRef(typeof performance !== 'undefined' ? performance.now() : Date.now());
+  const reconnectStartTimeRef = useRef(null);
+  const joinRecoveryRecordedRef = useRef(false);
+  // Phase 6.2A.1: the last playback.version actually fed into recoveryState.js.
+  // A membership-only room:update (someone else joining/leaving) still
+  // broadcasts the full state, but its `playback` is content-identical to
+  // what we already have - skipping receivePlaybackState in that case avoids
+  // marking a (redundant) pending entry and re-evaluating recovery for no
+  // reason, so an already-settled device is never disturbed by unrelated
+  // membership churn. tryConsumePending's own version check would have
+  // discarded a redundant entry anyway, so this is a perf/no-op-avoidance
+  // guard, not a correctness fix - genuinely newer playback always compares
+  // as different and still flows through normally.
+  const lastSeenPlaybackVersionRef = useRef(initialState.playback?.version ?? -1);
 
   // Seed the recovery machinery with the state we already have at mount.
   useEffect(() => {
@@ -64,7 +88,11 @@ export default function Room({ initialState, onLeave }) {
   useEffect(() => {
     function handleUpdate(newState) {
       setState(newState);
-      recoveryStateRef.current = receivePlaybackState(recoveryStateRef.current, newState.playback);
+      const incomingVersion = newState.playback?.version ?? -1;
+      if (incomingVersion !== lastSeenPlaybackVersionRef.current) {
+        lastSeenPlaybackVersionRef.current = incomingVersion;
+        recoveryStateRef.current = receivePlaybackState(recoveryStateRef.current, newState.playback);
+      }
       setHasLatestState(true);
     }
     function handleConnect() {
@@ -107,6 +135,7 @@ export default function Room({ initialState, onLeave }) {
     function handleReconnect() {
       if (rejoinInFlightRef.current) return; // guard against overlapping rejoin attempts
       rejoinInFlightRef.current = true;
+      reconnectStartTimeRef.current = typeof performance !== 'undefined' ? performance.now() : Date.now();
       setRoomJoined(false);
       setHasLatestState(false);
       setClockSynced(false);
@@ -118,6 +147,11 @@ export default function Room({ initialState, onLeave }) {
           return;
         }
         setState(ack.state);
+        // Unlike the membership-only guard in handleUpdate above, a reconnect
+        // ack is always processed unconditionally - the whole session context
+        // (clockSynced etc.) was just reset, so even a version-identical
+        // playback snapshot must be re-evaluated against fresh prerequisites.
+        lastSeenPlaybackVersionRef.current = ack.state.playback?.version ?? -1;
         recoveryStateRef.current = receivePlaybackState(recoveryStateRef.current, ack.state.playback);
         setRoomJoined(true);
         setHasLatestState(true);
@@ -272,6 +306,21 @@ export default function Room({ initialState, onLeave }) {
     recoveryStateRef.current = nextState;
     if (!toApply) return;
 
+    // Phase 7 benchmark facility: this is the moment recovery successfully
+    // produced a scheduling instruction - "valid synchronized playback"
+    // whether toApply is playing OR paused (see benchmark.js's documented
+    // measurement boundary). The first one ever counts as join recovery; one
+    // during an active reconnect window also closes that reconnect sample.
+    const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (!joinRecoveryRecordedRef.current) {
+      joinRecoveryRecordedRef.current = true;
+      recordJoinRecoveryGlobal(nowPerf - mountTimeRef.current);
+    }
+    if (reconnectStartTimeRef.current !== null) {
+      recordReconnectRecoveryGlobal(nowPerf - reconnectStartTimeRef.current);
+      reconnectStartTimeRef.current = null;
+    }
+
     if (toApply.status === 'paused') {
       schedulePause(toApply.anchorServerTime, offsetMs);
       return;
@@ -280,12 +329,42 @@ export default function Room({ initialState, onLeave }) {
     const decoded = bufferRef.current;
     if (!decoded.buffer || decoded.version !== toApply.trackVersion) {
       // Shouldn't normally happen given trackDecoded already gated this -
-      // stay defensive rather than schedule the wrong audio.
+      // stay defensive rather than schedule the wrong audio. This device
+      // will pick the pending state back up once decode catches up
+      // (decodedVersion changing re-triggers this effect); any stale source
+      // it's still playing meanwhile is retired by the effect below,
+      // independently of this decode-gated "start the new one" path.
       console.warn(`Playback pending: track v${toApply.trackVersion} not decoded on this device yet`);
       return;
     }
-    schedulePlay(decoded.buffer, toApply.positionSec, toApply.anchorServerTime, offsetMs);
+    schedulePlay(decoded.buffer, toApply.positionSec, toApply.anchorServerTime, offsetMs, toApply.trackVersion);
   }, [roomJoined, hasLatestState, clockSynced, decodedVersion, state.track?.version, state.playback?.version]);
+
+  // Phase 6.2A.1 (Issue 2 fix): retires a locally-playing source that
+  // belongs to a track the server has already moved on from, at the
+  // authoritative transition time - REGARDLESS of whether this device has
+  // decoded the new current track yet. Deliberately separate from the
+  // recovery-apply effect above: starting the new track stays gated on
+  // trackDecoded (can't schedule audio for a buffer that doesn't exist yet),
+  // but a device that isn't ready to start B must still never keep playing
+  // A - a stale AudioBufferSourceNode doesn't know or care that a Next/auto-
+  // advance happened server-side. Declared AFTER the recovery-apply effect
+  // so that on a normal (ready) transition, schedulePlay above already
+  // updated getCurrentTrackVersion() to match before this runs, making it a
+  // no-op there - it only actually does something for an unready device
+  // (the exact "unready device becomes silent" case from the Phase 6.2B
+  // brief), and its own schedulePause is itself a no-op if nothing is
+  // playing. Reuses schedulePause verbatim rather than a new stop-only
+  // primitive - it already does exactly "stop whatever's playing at this
+  // server time, touch nothing else".
+  useEffect(() => {
+    const pb = state.playback;
+    if (!pb || pb.status !== 'playing') return;
+    const activeTrackVersion = getCurrentTrackVersion();
+    if (activeTrackVersion === null || activeTrackVersion === pb.trackVersion) return;
+    const offsetMs = getClockOffsetMs();
+    schedulePause(pb.anchorServerTime, offsetMs);
+  }, [state.playback?.trackVersion, state.playback?.anchorServerTime, state.playback?.status]);
 
   // Periodic drift measurement + threshold-based correction. Does nothing at
   // all while paused (no interval is even created), and canMeasureDrift also
@@ -324,17 +403,19 @@ export default function Room({ initialState, onLeave }) {
       const expectedPositionSec = computeExpectedPositionSec(pb, nowServerMs, durationSec);
       const drift = computeDriftMs(actualPositionSec, expectedPositionSec);
       setDriftMs(drift);
+      recordDriftSampleGlobal(drift); // Phase 7 benchmark facility - raw sample, never fabricated
 
       const nextState = evaluateDriftSample(driftStateRef.current, drift, Date.now());
       driftStateRef.current = nextState;
       setCorrectionCount(nextState.correctionCount);
+      if (nextState.didCorrect) recordCorrectionGlobal();
 
       socket.emit('playback:driftReport', { driftMs: drift, correctionCount: nextState.correctionCount });
 
       if (nextState.didCorrect) {
         const correctionAnchorServerTime = nowServerMs + DEFAULT_CORRECTION_LEAD_MS;
         const correctedPositionSec = computeExpectedPositionSec(pb, correctionAnchorServerTime, durationSec);
-        schedulePlay(decoded.buffer, correctedPositionSec, correctionAnchorServerTime, offsetMs);
+        schedulePlay(decoded.buffer, correctedPositionSec, correctionAnchorServerTime, offsetMs, pb.trackVersion);
       }
     }, DEFAULT_MEASURE_INTERVAL_MS);
 
@@ -358,7 +439,20 @@ export default function Room({ initialState, onLeave }) {
     });
   }
 
-  const isHost = state.hostId === socket.id;
+  // Phase 6.2B roles: promote/demote/transfer are PRIMARY-host-only
+  // (mirrors the server's requireHost vs requireController split - see
+  // socketUtils.js). Playback/queue control is allowed for the primary host
+  // OR a co-host (canControl), computed from the authoritative isCoHost flag
+  // the server already includes per client, not a separately-tracked local
+  // flag that could go stale.
+  function handleRoleAction(event, targetSocketId) {
+    socket.emit(event, { targetSocketId }, () => {});
+  }
+
+  const isHost = state.hostId === socket.id; // PRIMARY host only
+  const myClient = state.clients.find((c) => c.id === socket.id);
+  const isCoHost = !!myClient?.isCoHost;
+  const canControl = isHost || isCoHost;
   const recoveryReady = arePrerequisitesMet({
     roomJoined,
     hasLatestState,
@@ -380,12 +474,10 @@ export default function Room({ initialState, onLeave }) {
       <h1>
         Room <span className="room-code">{state.roomCode}</span>
       </h1>
+      <InvitePanel roomCode={state.roomCode} />
       {!state.hostId && <p className="warning">No host in this room right now.</p>}
-      {isHost && <p className="host-tag">You are the host.</p>}
-
-      <TrackPanel isHost={isHost} track={state.track} />
-
-      <QueuePanel isHost={isHost} queue={state.queue || []} clients={state.clients} />
+      {isHost && <p className="host-tag">You are the primary host.</p>}
+      {isCoHost && <p className="host-tag">You are a co-host.</p>}
 
       <div className="ready-panel">
         <h2>Audio</h2>
@@ -404,16 +496,31 @@ export default function Room({ initialState, onLeave }) {
         )}
       </div>
 
+      <TrackPanel isHost={canControl} track={state.track} />
+
       <PlaybackControls
-        isHost={isHost}
+        isHost={canControl}
         playback={state.playback || DEFAULT_PLAYBACK}
         trackDurationSec={state.track?.durationSec ?? null}
       />
 
-      <Diagnostics driftMs={driftMs} correctionCount={correctionCount} />
+      <QueuePanel isHost={canControl} queue={state.queue || []} clients={state.clients} />
 
       <h2>Connected devices ({state.clients.length})</h2>
-      <DeviceList clients={state.clients} mySocketId={socket.id} />
+      <DeviceList
+        clients={state.clients}
+        mySocketId={socket.id}
+        isPrimaryHost={isHost}
+        onPromote={(id) => handleRoleAction('room:promoteCoHost', id)}
+        onDemote={(id) => handleRoleAction('room:demoteCoHost', id)}
+        onTransfer={(id) => handleRoleAction('room:transferHost', id)}
+      />
+
+      <Diagnostics driftMs={driftMs} correctionCount={correctionCount} />
+
+      <BenchmarkPanel rttMs={myClient?.rtt ?? null} />
+
+      <LocalSettings audioEnabled={audioEnabled} />
     </div>
   );
 }

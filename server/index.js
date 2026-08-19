@@ -13,6 +13,7 @@ const registerClockHandlers = require('./clockHandlers');
 const registerPlaybackHandlers = require('./playbackHandlers');
 const registerDriftHandlers = require('./driftHandlers');
 const registerQueueHandlers = require('./queueHandlers');
+const registerRoleHandlers = require('./roleHandlers');
 const roomManager = require('./roomManager');
 const { createUploadRouter, UPLOAD_DIR } = require('./uploadRoute');
 
@@ -66,6 +67,7 @@ io.on('connection', (socket) => {
   registerPlaybackHandlers(io, socket);
   registerDriftHandlers(io, socket);
   registerQueueHandlers(io, socket);
+  registerRoleHandlers(io, socket);
 
   // Single-sample Cristian's-algorithm style clock offset probe.
   // Phase 3 replaces this with an 8-10 sample, low-RTT/median robust estimate.

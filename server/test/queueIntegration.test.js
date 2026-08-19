@@ -10,49 +10,13 @@ const fs = require('fs');
 const path = require('path');
 const { io } = require('socket.io-client');
 const { UPLOAD_DIR } = require('../uploadRoute');
+const { BASE, waitConnected, emitAck, waitForRoomUpdate, uploadTrack } = require('../testUtils');
 
-const BASE = process.env.SYNCWAVE_SERVER_URL || 'http://localhost:3001';
 const wavPath = path.join(__dirname, '..', 'public', 'audio', 'test-tone.wav');
 const wavBytes = fs.readFileSync(wavPath);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-function waitConnected(socket) {
-  if (socket.connected) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    socket.once('connect', resolve);
-    socket.once('connect_error', reject);
-  });
-}
-function emitAck(socket, event, payload) {
-  return new Promise((resolve) => socket.emit(event, payload, resolve));
-}
-function waitForRoomUpdate(socket, predicate, timeoutMs = 3000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      socket.off('room:update', handler);
-      reject(new Error('waitForRoomUpdate timed out'));
-    }, timeoutMs);
-    function handler(state) {
-      if (predicate(state)) {
-        clearTimeout(timer);
-        socket.off('room:update', handler);
-        resolve(state);
-      }
-    }
-    socket.on('room:update', handler);
-  });
-}
-async function uploadTrack(token, bytes, filename = 'test-tone.wav') {
-  const form = new FormData();
-  form.append('file', new Blob([bytes]), filename);
-  const res = await fetch(`${BASE}/api/upload`, {
-    method: 'POST',
-    headers: token ? { 'x-upload-token': token } : {},
-    body: form,
-  });
-  return { status: res.status, data: await res.json().catch(() => ({})) };
 }
 async function getToken(hostSocket) {
   const tokenRes = await emitAck(hostSocket, 'track:requestUploadToken', {});

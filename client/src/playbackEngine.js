@@ -8,6 +8,70 @@ import { getAudioContext } from './audioEngine.js';
 
 let currentSource = null;
 let currentAnchor = null; // { audioContextTime, bufferOffsetSec } - the Web Audio scheduling anchor for whatever is currently playing/scheduled; null when nothing is
+// Phase 6.2A.1: the playback.trackVersion the currently-scheduled/playing
+// source belongs to (null when nothing is playing). Lets a caller detect
+// "the authoritative current track has moved on, but I haven't started the
+// new one yet" independently of buffer readiness - see getCurrentTrackVersion.
+let currentTrackVersion = null;
+
+// Pure-ish getter: which track (by playback.trackVersion) is the locally
+// active source actually for, if any. Room.jsx uses this to decide whether a
+// locally playing source has become stale (belongs to a track that's no
+// longer the authoritative current one) and must be retired even before this
+// device has decoded the new track's buffer - see the Phase 6.2A.1 "retire
+// stale source" effect.
+export function getCurrentTrackVersion() {
+  return currentTrackVersion;
+}
+
+// Phase 6.2B: a single persistent GainNode sitting between every
+// AudioBufferSourceNode and the destination, so local volume/mute survives
+// source recreation across Play/Seek/drift correction/Next - the gain node
+// itself is never recreated, only (re)connected to by fresh sources. Purely
+// local: never touches authoritative playback state, never sent to other
+// devices, never affects synchronization (it's downstream of scheduling, not
+// part of it).
+let gainNode = null;
+
+function getGainNode() {
+  const ctx = getAudioContext();
+  if (!gainNode) {
+    gainNode = ctx.createGain();
+    gainNode.connect(ctx.destination);
+  }
+  return gainNode;
+}
+
+// Sets local playback volume (0-1 linear gain). Callers (LocalSettings.jsx)
+// compute the effective value themselves (e.g. 0 while muted) rather than
+// this module tracking a separate "muted" concept - one number, one job.
+export function setVolume(volume) {
+  const clamped = Math.max(0, Math.min(1, volume));
+  getGainNode().gain.value = clamped;
+}
+
+export function getVolume() {
+  return gainNode ? gainNode.gain.value : 1;
+}
+
+// Phase 6.2B: local device-latency calibration, kept entirely separate from
+// the Phase 3 network clock offset - see recoveryState.js/clockSync.js for
+// that. A positive calibrationOffsetMs means "start this device's audio
+// EARLIER" (compensating for output-path latency - e.g. Bluetooth/DAC
+// delay - so the audible sound lands closer to the intended instant).
+// Applied only in the LIVE scheduling wrapper below, never in
+// computeAudioContextStartTime itself, so the pure/tested clock-conversion
+// formula is untouched - this is purely an additive local adjustment on top
+// of it.
+let calibrationOffsetMs = 0;
+
+export function setCalibrationOffsetMs(ms) {
+  calibrationOffsetMs = Number.isFinite(ms) ? ms : 0;
+}
+
+export function getCalibrationOffsetMs() {
+  return calibrationOffsetMs;
+}
 
 // Pure: converts a server-anchored target time into a local AudioContext
 // time. offsetMs follows the Phase 3 convention (serverTime = clientTime +
@@ -19,12 +83,15 @@ export function computeAudioContextStartTime({ anchorServerTime, offsetMs, nowMs
   return audioContextCurrentTime + delaySec;
 }
 
-// Live wrapper around computeAudioContextStartTime using the real clock/offset/AudioContext.
+// Live wrapper around computeAudioContextStartTime using the real clock/
+// offset/AudioContext, PLUS the local calibration adjustment on top of the
+// network clock offset - see setCalibrationOffsetMs above for the sign
+// convention and why it's applied here rather than in the pure function.
 function scheduleTimeFor(anchorServerTime, offsetMs) {
   const ctx = getAudioContext();
   return computeAudioContextStartTime({
     anchorServerTime,
-    offsetMs,
+    offsetMs: (offsetMs ?? 0) + calibrationOffsetMs,
     nowMs: Date.now(),
     audioContextCurrentTime: ctx.currentTime,
   });
@@ -56,7 +123,7 @@ export function getActualPositionSec() {
 // to begin at the server's `anchorServerTime`. If something is already
 // scheduled/playing, it's stopped at that exact same instant so devices cut
 // over together rather than overlapping or leaving a device-local gap.
-export function schedulePlay(buffer, offsetSec, anchorServerTime, offsetMs) {
+export function schedulePlay(buffer, offsetSec, anchorServerTime, offsetMs, trackVersion = null) {
   const ctx = getAudioContext();
   const whenSec = Math.max(ctx.currentTime, scheduleTimeFor(anchorServerTime, offsetMs));
   const safeOffset = Math.max(0, offsetSec);
@@ -65,7 +132,7 @@ export function schedulePlay(buffer, offsetSec, anchorServerTime, offsetMs) {
   if (safeOffset < buffer.duration) {
     const source = ctx.createBufferSource();
     source.buffer = buffer;
-    source.connect(ctx.destination);
+    source.connect(getGainNode());
     // Local cleanup only when the track naturally reaches its end - never
     // emits anything, and never touches authoritative state (the server's
     // own end timer, not this event, is what decides natural completion for
@@ -77,15 +144,18 @@ export function schedulePlay(buffer, offsetSec, anchorServerTime, offsetMs) {
       if (currentSource === source) {
         currentSource = null;
         currentAnchor = null;
+        currentTrackVersion = null;
       }
     };
     source.start(whenSec, safeOffset);
     currentSource = source;
     currentAnchor = { audioContextTime: whenSec, bufferOffsetSec: safeOffset };
+    currentTrackVersion = trackVersion;
   } else {
     // Seeking at/past the end of the track: nothing to play, just stop.
     currentSource = null;
     currentAnchor = null;
+    currentTrackVersion = null;
   }
 
   if (previousSource) {
@@ -113,6 +183,7 @@ export function schedulePause(anchorServerTime, offsetMs) {
   }
   currentSource = null;
   currentAnchor = null;
+  currentTrackVersion = null;
 }
 
 // Immediately stops and discards any scheduled/playing source - used when
@@ -132,4 +203,5 @@ export function resetPlaybackEngine() {
     currentSource = null;
   }
   currentAnchor = null;
+  currentTrackVersion = null;
 }

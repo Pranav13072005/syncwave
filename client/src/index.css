@@ -148,6 +148,22 @@ button {
   color: #0a7d2c;
 }
 
+.badge-cohost {
+  background: #ffe4c2;
+  color: #8a4b00;
+}
+
+.device-role-controls {
+  margin-left: auto;
+  display: flex;
+  gap: 0.25rem;
+}
+
+.device-role-controls button {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.4rem;
+}
+
 .track-panel,
 .ready-panel,
 .diagnostics-panel,
@@ -285,4 +301,122 @@ button {
 .queue-item-controls button {
   font-size: 0.8rem;
   padding: 0.2rem 0.5rem;
+}
+
+.benchmark-panel {
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+
+.benchmark-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.benchmark-panel .diagnostics-grid {
+  margin-top: 0.75rem;
+}
+
+.invite-panel {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 0.5rem 0 1rem;
+}
+
+.invite-panel button {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.7rem;
+}
+
+.local-settings-panel {
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+
+.local-settings-panel h2 {
+  margin-top: 0;
+  font-size: 1rem;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.setting-row label {
+  min-width: 10rem;
+  font-size: 0.9rem;
+}
+
+.setting-row input[type='range'] {
+  flex: 1;
+  min-width: 8rem;
+  width: auto;
+}
+
+/* Responsive polish: laptop/desktop is the baseline layout above; this
+   tightens spacing and stacks controls for phones without changing the
+   information hierarchy (Room.jsx already orders sections per the intended
+   Room name/code -> Now Playing -> Queue -> Devices -> Diagnostics ->
+   Local Settings flow, so this is spacing/sizing only, not restructuring). */
+@media (max-width: 480px) {
+  #root {
+    padding: 1rem 0.75rem;
+  }
+
+  button {
+    padding: 0.6rem 1rem;
+    min-height: 2.5rem;
+  }
+
+  .landing-actions {
+    flex-direction: column;
+  }
+
+  .room-header {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .setting-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.35rem;
+  }
+
+  .setting-row label {
+    min-width: 0;
+  }
+
+  .device-list li,
+  .queue-list li {
+    flex-wrap: wrap;
+  }
+
+  .device-role-controls,
+  .queue-item-controls {
+    margin-left: 0;
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .playback-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .playback-controls input {
+    width: 100%;
+  }
 }

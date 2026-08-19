@@ -68,6 +68,7 @@ function createRoom(hostSocketId, hostName) {
     code,
     hostId: hostSocketId,
     clients: new Map([[hostSocketId, makeClientEntry(hostSocketId, hostName)]]),
+    coHostIds: new Set(), // Phase 6.2B: socketIds with co-host privileges (play/pause/seek/next/queue), distinct from the single primary hostId
     track: null, // { trackId, version, originalName, mimeType, size, url, storedFilename, uploadedAt, durationSec? } - the current track
     queue: [], // [{ trackId, originalName, mimeType, size, url, storedFilename, uploadedAt, durationSec? }, ...] - upcoming tracks, queue[0] is the immediate-next preload candidate
     readyDevices: new Set(), // socketIds that have decoded room.track at its current version
@@ -109,16 +110,65 @@ function joinRoom(roomCode, socketId, name) {
   return { room };
 }
 
-// Deterministically promotes the longest-connected remaining client (lowest
-// joinedAt) to host, or clears hostId if no one remains.
+// Deterministically promotes a new primary host on the old one's disconnect
+// (Phase 6.2B): prefers the longest-connected remaining CO-HOST, if any -
+// they already have some delegated authority, so continuity of control is
+// more intuitive - and only falls back to the longest-connected remaining
+// member of any role if there is no co-host left. Clears hostId if no one
+// remains. The promoted client is removed from coHostIds (they're now
+// primary, not "also" a co-host) - a no-op if they were promoted from the
+// no-co-host fallback path. With zero co-hosts ever created (every
+// pre-Phase-6.2B room), this is identical to the original
+// longest-connected-of-anyone rule.
 function promoteNewHost(room) {
-  let longestConnected = null;
+  let candidate = null;
   for (const client of room.clients.values()) {
-    if (!longestConnected || client.joinedAt < longestConnected.joinedAt) {
-      longestConnected = client;
+    if (!room.coHostIds.has(client.id)) continue;
+    if (!candidate || client.joinedAt < candidate.joinedAt) candidate = client;
+  }
+  if (!candidate) {
+    for (const client of room.clients.values()) {
+      if (!candidate || client.joinedAt < candidate.joinedAt) candidate = client;
     }
   }
-  room.hostId = longestConnected ? longestConnected.id : null;
+  room.hostId = candidate ? candidate.id : null;
+  if (candidate) room.coHostIds.delete(candidate.id);
+}
+
+// Role-management primitives (Phase 6.2B). Authorization ("is the CALLER
+// allowed to do this") is enforced by socketUtils.js/the handlers, exactly
+// like every other roomManager function - these just mutate/validate state.
+
+function promoteToCoHost(roomCode, targetSocketId) {
+  const room = rooms.get(roomCode);
+  if (!room) return { error: 'NO_ROOM' };
+  if (!room.clients.has(targetSocketId)) return { error: 'TARGET_NOT_IN_ROOM' };
+  if (room.hostId === targetSocketId) return { error: 'ALREADY_PRIMARY_HOST' };
+  room.coHostIds.add(targetSocketId);
+  return { room };
+}
+
+function demoteToParticipant(roomCode, targetSocketId) {
+  const room = rooms.get(roomCode);
+  if (!room) return { error: 'NO_ROOM' };
+  room.coHostIds.delete(targetSocketId);
+  return { room };
+}
+
+// Voluntary transfer: the OLD primary becomes a co-host (not demoted all the
+// way to participant) - gives intuitive room continuity per the brief,
+// rather than the outgoing host suddenly losing all control after choosing
+// to hand it off.
+function transferPrimaryHost(roomCode, targetSocketId, requestingSocketId) {
+  const room = rooms.get(roomCode);
+  if (!room) return { error: 'NO_ROOM' };
+  if (!room.clients.has(targetSocketId)) return { error: 'TARGET_NOT_IN_ROOM' };
+  if (targetSocketId === requestingSocketId) return { error: 'ALREADY_PRIMARY_HOST' };
+  const oldHostId = room.hostId;
+  room.hostId = targetSocketId;
+  room.coHostIds.delete(targetSocketId);
+  room.coHostIds.add(oldHostId);
+  return { room };
 }
 
 // Starts (or no-ops if already running) the grace-period cleanup timer for
@@ -159,6 +209,7 @@ function leaveRoom(socketId) {
       room.clients.delete(socketId);
       room.readyDevices.delete(socketId);
       room.nextReadyDevices.delete(socketId);
+      room.coHostIds.delete(socketId);
       if (room.hostId === socketId) {
         promoteNewHost(room);
       }
@@ -566,6 +617,7 @@ function toPublicState(room) {
     clients: Array.from(room.clients.values()).map((c) => ({
       ...c,
       isHost: c.id === room.hostId,
+      isCoHost: room.coHostIds.has(c.id),
       isReady: room.readyDevices.has(c.id),
       isNextReady: room.nextReadyDevices.has(c.id),
     })),
@@ -586,6 +638,9 @@ module.exports = {
   setNextReady,
   advanceToNextTrack,
   issueNextCommand,
+  promoteToCoHost,
+  demoteToParticipant,
+  transferPrimaryHost,
   updateClientDiagnostics,
   updatePlaybackDiagnostics,
   getCanonicalPosition,

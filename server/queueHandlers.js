@@ -7,7 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const roomManager = require('./roomManager');
-const { requireHost } = require('./socketUtils');
+const { requireController } = require('./socketUtils');
 const { UPLOAD_DIR } = require('./uploadRoute');
 
 function deleteStoredFile(storedFilename) {
@@ -17,7 +17,7 @@ function deleteStoredFile(storedFilename) {
 
 function registerQueueHandlers(io, socket) {
   socket.on('queue:remove', ({ trackId } = {}, ack) => {
-    const check = requireHost(socket);
+    const check = requireController(socket);
     if (check.error) {
       ack?.({ ok: false, error: check.error });
       return;
@@ -33,7 +33,7 @@ function registerQueueHandlers(io, socket) {
   });
 
   socket.on('queue:reorder', ({ trackId, toIndex } = {}, ack) => {
-    const check = requireHost(socket);
+    const check = requireController(socket);
     if (check.error) {
       ack?.({ ok: false, error: check.error });
       return;
@@ -48,7 +48,7 @@ function registerQueueHandlers(io, socket) {
   });
 
   socket.on('queue:next', (_payload, ack) => {
-    const check = requireHost(socket);
+    const check = requireController(socket);
     if (check.error) {
       ack?.({ ok: false, error: check.error });
       return;

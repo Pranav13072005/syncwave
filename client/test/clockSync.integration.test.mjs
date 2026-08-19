@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { io } from 'socket.io-client';
-import { runClockSync, onClockSyncResult } from '../src/clockSync.js';
+import { runClockSync, onClockSyncResult, getClockOffsetMs } from '../src/clockSync.js';
 
 const BASE = process.env.SYNCWAVE_SERVER_URL || 'http://localhost:3001';
 
@@ -113,6 +113,24 @@ test('onClockSyncResult subscribers are notified when a sync round completes (Ph
   const result = await runClockSync(socket, { sampleCount: 3 });
   assert.equal(notifiedResult, result, 'the subscriber must receive the exact same result runClockSync returned');
   assert.equal(notifiedResult.status, 'synced');
+});
+
+test('Phase 6.2A.1: an older in-flight runClockSync call cannot overwrite a newer one\'s result', async (t) => {
+  const socket = io(BASE);
+  t.after(() => socket.close());
+  await waitConnected(socket);
+
+  // Start a SLOWER sync (more samples, a real inter-sample delay) first...
+  const slowPromise = runClockSync(socket, { sampleCount: 6, interSampleDelayMs: 120 });
+  await new Promise((resolve) => setTimeout(resolve, 60)); // let it actually start sampling
+  // ...then start a FASTER one that will finish first despite starting second.
+  const fastResult = await runClockSync(socket, { sampleCount: 2, interSampleDelayMs: 0 });
+  assert.equal(fastResult.status, 'synced');
+  assert.equal(getClockOffsetMs(), fastResult.offsetMs, 'the newer (later-started) call\'s result must be the one currently applied');
+
+  const slowResult = await slowPromise; // let the older call finish too
+  assert.equal(slowResult.status, 'synced', 'the older call still resolves normally for its own caller');
+  assert.equal(getClockOffsetMs(), fastResult.offsetMs, 'the older call finishing LATER must not overwrite the newer result already applied');
 });
 
 test('clock:report from a socket not in any room no-ops gracefully', async (t) => {

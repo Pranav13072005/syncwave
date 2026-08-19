@@ -13,7 +13,7 @@ function registerTrackHandlers(io, socket) {
       ack?.({ ok: false, error: 'NO_ROOM' });
       return;
     }
-    if (room.hostId !== socket.id) {
+    if (room.hostId !== socket.id && !room.coHostIds.has(socket.id)) {
       ack?.({ ok: false, error: 'NOT_HOST' });
       return;
     }

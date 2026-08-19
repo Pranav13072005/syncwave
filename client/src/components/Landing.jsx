@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { socket } from '../socket';
 
-export default function Landing({ onRoomJoined }) {
+export default function Landing({ onRoomJoined, initialRoomCode = '' }) {
   const [name, setName] = useState('');
-  const [joinCode, setJoinCode] = useState('');
+  const [joinCode, setJoinCode] = useState(initialRoomCode);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -62,6 +62,7 @@ export default function Landing({ onRoomJoined }) {
 
         <form onSubmit={handleJoin} className="landing-card">
           <h2>Join a room</h2>
+          {initialRoomCode && <p className="hint">Joining room {initialRoomCode} via invite link.</p>}
           <input
             value={joinCode}
             onChange={(e) => setJoinCode(e.target.value.toUpperCase())}

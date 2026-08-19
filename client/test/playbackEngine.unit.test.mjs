@@ -2,7 +2,14 @@
 // staleness guard. No AudioContext/socket needed. `node --test test/`
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeAudioContextStartTime, isNewerPlaybackVersion, computeActualPosition } from '../src/playbackEngine.js';
+import {
+  computeAudioContextStartTime,
+  isNewerPlaybackVersion,
+  computeActualPosition,
+  setCalibrationOffsetMs,
+  getCalibrationOffsetMs,
+  getCurrentTrackVersion,
+} from '../src/playbackEngine.js';
 
 test('computeAudioContextStartTime converts a future server time into a future AudioContext delay', () => {
   // Server is 1500ms ahead of the client's clock (offsetMs=1500), server
@@ -60,4 +67,33 @@ test('computeActualPosition clamps to the anchor offset during the pre-roll wind
   const anchor = { audioContextTime: 10, bufferOffsetSec: 5 };
   const pos = computeActualPosition(anchor, 8); // ctx.currentTime is before the scheduled start
   assert.equal(pos, 5);
+});
+
+// --- Phase 6.2B: local device-latency calibration (kept separate from the
+// network clock offset - see recoveryState.js/clockSync.js for that) ---
+
+test('setCalibrationOffsetMs/getCalibrationOffsetMs store and retrieve the local value', () => {
+  setCalibrationOffsetMs(25);
+  assert.equal(getCalibrationOffsetMs(), 25);
+  setCalibrationOffsetMs(-50);
+  assert.equal(getCalibrationOffsetMs(), -50);
+  setCalibrationOffsetMs(0); // reset so other tests in this module see a clean default
+});
+
+test('setCalibrationOffsetMs falls back to 0 for a non-finite value rather than corrupting scheduling', () => {
+  setCalibrationOffsetMs(NaN);
+  assert.equal(getCalibrationOffsetMs(), 0);
+  setCalibrationOffsetMs(undefined);
+  assert.equal(getCalibrationOffsetMs(), 0);
+});
+
+// --- Phase 6.2A.1: stale-source identity tracking ---
+
+test('getCurrentTrackVersion is null before anything has ever been scheduled', () => {
+  // Fresh module state (nothing else in this file calls schedulePlay, which
+  // is the only thing that would set it - schedulePlay/schedulePause/
+  // resetPlaybackEngine all need a real AudioContext, so their effect on
+  // this getter is verified by code inspection + manual testing, same
+  // established limitation as every other AudioContext-touching function).
+  assert.equal(getCurrentTrackVersion(), null);
 });

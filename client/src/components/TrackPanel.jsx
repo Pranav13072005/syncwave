@@ -51,10 +51,10 @@ export default function TrackPanel({ isHost, track }) {
 
   return (
     <div className="track-panel">
-      <h2>Track</h2>
+      <h2>Now Playing</h2>
       {track ? (
         <p>
-          Now playing: <strong>{track.originalName}</strong> ({(track.size / (1024 * 1024)).toFixed(1)} MB)
+          <strong>{track.originalName}</strong> ({(track.size / (1024 * 1024)).toFixed(1)} MB)
         </p>
       ) : (
         <p>No track uploaded yet.</p>

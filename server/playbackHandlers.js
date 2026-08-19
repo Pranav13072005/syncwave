@@ -1,13 +1,14 @@
-// Socket.IO events for host-issued playback control (play/pause/seek).
-// All state math (canonical position, versioning, future scheduling target)
-// lives in roomManager.js - this file only enforces "who is allowed to ask"
-// (host-only) and broadcasts the result via the existing room:update.
+// Socket.IO events for playback control (play/pause/seek), issuable by the
+// primary host or any co-host (Phase 6.2B). All state math (canonical
+// position, versioning, future scheduling target) lives in roomManager.js -
+// this file only enforces "who is allowed to ask" and broadcasts the result
+// via the existing room:update.
 const roomManager = require('./roomManager');
-const { requireHost } = require('./socketUtils');
+const { requireController } = require('./socketUtils');
 
 function registerPlaybackHandlers(io, socket) {
   socket.on('playback:play', (_payload, ack) => {
-    const check = requireHost(socket);
+    const check = requireController(socket);
     if (check.error) {
       ack?.({ ok: false, error: check.error });
       return;
@@ -22,7 +23,7 @@ function registerPlaybackHandlers(io, socket) {
   });
 
   socket.on('playback:pause', (_payload, ack) => {
-    const check = requireHost(socket);
+    const check = requireController(socket);
     if (check.error) {
       ack?.({ ok: false, error: check.error });
       return;
@@ -37,7 +38,7 @@ function registerPlaybackHandlers(io, socket) {
   });
 
   socket.on('playback:seek', ({ positionSec } = {}, ack) => {
-    const check = requireHost(socket);
+    const check = requireController(socket);
     if (check.error) {
       ack?.({ ok: false, error: check.error });
       return;

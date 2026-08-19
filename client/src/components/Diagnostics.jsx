@@ -15,6 +15,15 @@ export default function Diagnostics({ driftMs = null, correctionCount = 0 }) {
   const [offsetMs, setOffsetMs] = useState(null);
   const [sampleCount, setSampleCount] = useState(0);
   const cancelledRef = useRef(false);
+  // Phase 6.2A.1: guards against two overlapping sync() calls from THIS
+  // component (e.g. the mount-triggered sync still running when a
+  // near-simultaneous reconnect fires another one) - without this, both
+  // would run their full 9-sample round concurrently, and whichever
+  // finishes LAST would win regardless of which started last, potentially
+  // applying a stale result locally and reporting it to the server. Complements
+  // (does not replace) clockSync.js's own module-level generation guard,
+  // which protects OTHER consumers of getClockOffsetMs() the same way.
+  const syncInFlightRef = useRef(false);
 
   const applyResult = useCallback((result) => {
     if (cancelledRef.current) return;
@@ -30,9 +39,15 @@ export default function Diagnostics({ driftMs = null, correctionCount = 0 }) {
   }, []);
 
   const sync = useCallback(async () => {
+    if (syncInFlightRef.current) return; // an equivalent round is already running - its result will apply for us too
+    syncInFlightRef.current = true;
     setStatus('syncing');
-    const result = await runClockSync(socket);
-    applyResult(result);
+    try {
+      const result = await runClockSync(socket);
+      applyResult(result);
+    } finally {
+      syncInFlightRef.current = false;
+    }
   }, [applyResult]);
 
   useEffect(() => {
