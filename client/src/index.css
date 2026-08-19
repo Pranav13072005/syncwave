@@ -236,3 +236,53 @@ button {
   opacity: 0.6;
   cursor: default;
 }
+
+.queue-panel {
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+
+.queue-panel h2 {
+  margin-top: 0;
+  font-size: 1rem;
+}
+
+.queue-ready-count {
+  font-size: 0.8rem;
+  margin-top: -0.25rem;
+}
+
+.queue-list {
+  list-style: decimal;
+  padding-left: 1.25rem;
+  margin: 0 0 0.75rem;
+}
+
+.queue-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid #eee;
+}
+
+.queue-track-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-item-controls {
+  margin-left: auto;
+  display: flex;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+.queue-item-controls button {
+  font-size: 0.8rem;
+  padding: 0.2rem 0.5rem;
+}

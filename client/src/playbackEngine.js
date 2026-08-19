@@ -66,6 +66,19 @@ export function schedulePlay(buffer, offsetSec, anchorServerTime, offsetMs) {
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
+    // Local cleanup only when the track naturally reaches its end - never
+    // emits anything, and never touches authoritative state (the server's
+    // own end timer, not this event, is what decides natural completion for
+    // the room). .stop() is also called intentionally for pause/seek/drift-
+    // correction/recovery, which fires onended too, so this must only ever
+    // clear state for the source that's STILL current - a `.stop()`'d node
+    // whose replacement has already been scheduled must not clobber it.
+    source.onended = () => {
+      if (currentSource === source) {
+        currentSource = null;
+        currentAnchor = null;
+      }
+    };
     source.start(whenSec, safeOffset);
     currentSource = source;
     currentAnchor = { audioContextTime: whenSec, bufferOffsetSec: safeOffset };

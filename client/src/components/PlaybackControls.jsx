@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { socket } from '../socket';
 import { getClockOffsetMs } from '../clockSync';
+import { computeExpectedPositionSec } from '../driftMonitor';
 
 const ERROR_MESSAGES = {
   NOT_HOST: 'Only the host can control playback.',
@@ -11,17 +12,15 @@ const ERROR_MESSAGES = {
 };
 
 // Extrapolates a live display position from the last authoritative playback
-// state - for the UI only, never fed back into audio scheduling. Uses the
-// same math as the server's getCanonicalPosition, but with the client's own
-// offset-adjusted notion of "server time now".
-function estimateDisplayPosition(playback) {
-  if (playback.status !== 'playing' || playback.anchorServerTime == null) {
-    return playback.positionSec;
-  }
+// state - for the UI only, never fed back into audio scheduling. Reuses the
+// same canonical-position helper the server/drift-monitor/recovery all use
+// (rather than re-deriving the elapsed-time math here), with the client's
+// own offset-adjusted notion of "server time now" and clamped to the track's
+// duration so the displayed timeline never advances past it.
+function estimateDisplayPosition(playback, durationSec) {
   const offsetMs = getClockOffsetMs() ?? 0;
   const estimatedServerNow = Date.now() + offsetMs;
-  const elapsedSec = Math.max(0, (estimatedServerNow - playback.anchorServerTime) / 1000);
-  return playback.positionSec + elapsedSec;
+  return computeExpectedPositionSec(playback, estimatedServerNow, durationSec);
 }
 
 export default function PlaybackControls({ isHost, playback, trackDurationSec }) {
@@ -54,7 +53,7 @@ export default function PlaybackControls({ isHost, playback, trackDurationSec })
     send('playback:seek', { positionSec });
   }
 
-  const displayPosition = estimateDisplayPosition(playback);
+  const displayPosition = estimateDisplayPosition(playback, trackDurationSec);
   const statusLabel = playback.status === 'playing' ? 'Playing' : 'Paused';
 
   return (

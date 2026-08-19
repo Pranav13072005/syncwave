@@ -180,6 +180,39 @@ test('late join while paused: the received "paused" state is surfaced for adopti
   // is even needed here - the frozen position needs no extrapolation.
 });
 
+// --- late join / reconnect after natural completion (Phase 6.1) ---
+// Natural completion transitions authoritative playback to a normal
+// 'paused' state at positionSec===durationSec - there is no separate
+// "ended" status, so this reuses the exact same paused-state path as any
+// other pause above. These tests exist to explicitly pin that contract for
+// the completion scenario specifically (status paused, position AT the
+// track's end), since that's what Room.jsx relies on to correctly show "no
+// audio" for a device joining/reconnecting after the track already finished.
+
+test('late join after completion: receives paused-at-duration and is never told to schedule audio', () => {
+  let state = createInitialRecoveryState();
+  const completedState = playback(6, { status: 'paused', positionSec: 180, anchorServerTime: 999000, trackVersion: 2 });
+  state = receivePlaybackState(state, completedState);
+  const result = tryConsumePending(state, ALL_MET);
+  assert.equal(result.toApply.status, 'paused');
+  assert.equal(result.toApply.positionSec, 180, 'must show paused exactly at the track duration, not some other position');
+});
+
+test('reconnect after completion: rejoin ack carries paused-at-duration, resuming with no audio', () => {
+  let state = createInitialRecoveryState();
+  // This device applied version 5 (still playing) before disconnecting.
+  state = receivePlaybackState(state, playback(5, { status: 'playing', positionSec: 170, anchorServerTime: 0 }));
+  state = tryConsumePending(state, ALL_MET, { nowServerTimeMs: 0 }).nextState;
+
+  // While disconnected, the track finished naturally (server-side timer),
+  // bumping to a new version. The rejoin ack delivers that.
+  state = receivePlaybackState(state, playback(6, { status: 'paused', positionSec: 180, trackVersion: 2 }));
+  const result = tryConsumePending(state, ALL_MET);
+  assert.equal(result.toApply.status, 'paused');
+  assert.equal(result.toApply.positionSec, 180);
+  assert.equal(result.nextState.appliedVersion, 6);
+});
+
 // --- reconnect while playing ---
 
 test('reconnect while playing: prerequisites reset to unmet, then re-earned, then the latest (elapsed-adjusted) state applies', () => {

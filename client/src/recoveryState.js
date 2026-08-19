@@ -50,10 +50,7 @@ export function receivePlaybackState(state, playbackState) {
 // so a very late apply never proposes a position past the end of the track.
 export function computeScheduledPlayingState(playback, nowServerTimeMs, { leadMs = RECOVERY_SCHEDULING_LEAD_MS, durationSec = null } = {}) {
   const targetServerTime = Math.max(playback.anchorServerTime, nowServerTimeMs + leadMs);
-  let positionSec = computeExpectedPositionSec(playback, targetServerTime);
-  if (typeof durationSec === 'number' && Number.isFinite(durationSec)) {
-    positionSec = Math.min(positionSec, durationSec);
-  }
+  const positionSec = computeExpectedPositionSec(playback, targetServerTime, durationSec);
   return { ...playback, positionSec, anchorServerTime: targetServerTime };
 }
 

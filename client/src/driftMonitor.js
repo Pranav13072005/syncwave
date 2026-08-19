@@ -11,13 +11,25 @@ export const DEFAULT_CORRECTION_LEAD_MS = 150; // local self-correction only, no
 // Pure: authoritative position at a given (estimated) server time, mirroring
 // server/roomManager.js's getCanonicalPosition. Only meaningful while
 // playing; paused/absent playback just returns the frozen position.
-export function computeExpectedPositionSec(playback, atServerTimeMs) {
+// Clamped to [0, durationSec] when durationSec is known (optional 3rd
+// param, omit/null for no clamp) - this is THE shared canonical-position
+// helper reused by recoveryState.js's recovery math, Room.jsx's drift
+// measurement/correction, and PlaybackControls.jsx's display, so clamping
+// here once covers all of them rather than duplicating the bound in each.
+export function computeExpectedPositionSec(playback, atServerTimeMs, durationSec = null) {
   if (!playback) return 0;
+  let positionSec;
   if (playback.status !== 'playing' || playback.anchorServerTime == null) {
-    return playback.positionSec;
+    positionSec = playback.positionSec;
+  } else {
+    const elapsedSec = Math.max(0, (atServerTimeMs - playback.anchorServerTime) / 1000);
+    positionSec = playback.positionSec + elapsedSec;
   }
-  const elapsedSec = Math.max(0, (atServerTimeMs - playback.anchorServerTime) / 1000);
-  return playback.positionSec + elapsedSec;
+  positionSec = Math.max(0, positionSec);
+  if (typeof durationSec === 'number' && Number.isFinite(durationSec) && durationSec >= 0) {
+    positionSec = Math.min(positionSec, durationSec);
+  }
+  return positionSec;
 }
 
 // Pure: signed drift in ms. Positive = client is ahead of the authoritative

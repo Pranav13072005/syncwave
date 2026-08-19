@@ -150,3 +150,61 @@ test('a seek issued while playing then paused correctly carries the sought posit
   assert.ok(pauseResult.room.playback.positionSec >= 55, `expected position >= 55, got ${pauseResult.room.playback.positionSec}`);
   assert.ok(pauseResult.room.playback.positionSec < 57, `expected position reasonably close to 55, got ${pauseResult.room.playback.positionSec}`);
 });
+
+// --- natural-completion-related: canonical position clamping ---
+
+test('canonical position clamps exactly at duration once elapsed time would carry it past the end', () => {
+  const room = roomManager.createRoom('sock-15', 'Host');
+  roomManager.setTrack(room.code, makeTrackMeta());
+  roomManager.setReady('sock-15', room.track.version, 180); // 180s track
+  const playResult = roomManager.issuePlayCommand(room.code);
+  // Exactly at the moment it would naturally end (180s after the anchor).
+  const exactEnd = playResult.targetServerTime + 180 * 1000;
+  assert.equal(roomManager.getCanonicalPosition(room, exactEnd), 180);
+});
+
+test('canonical position never exceeds duration, no matter how far past the end "now" is', () => {
+  const room = roomManager.createRoom('sock-16', 'Host');
+  roomManager.setTrack(room.code, makeTrackMeta());
+  roomManager.setReady('sock-16', room.track.version, 180);
+  const playResult = roomManager.issuePlayCommand(room.code);
+  const wayPastTheEnd = playResult.targetServerTime + 999 * 1000; // 999s later, track is 180s
+  assert.equal(roomManager.getCanonicalPosition(room, wayPastTheEnd), 180);
+});
+
+test('canonical position is unaffected by clamping when duration is unknown or not yet reached', () => {
+  const room = roomManager.createRoom('sock-17', 'Host');
+  roomManager.setTrack(room.code, makeTrackMeta());
+  // No duration reported yet - nothing to clamp against.
+  const playResult = roomManager.issuePlayCommand(room.code);
+  const fiveSecondsLater = playResult.targetServerTime + 5000;
+  assert.ok(Math.abs(roomManager.getCanonicalPosition(room, fiveSecondsLater) - 5) < 0.001);
+});
+
+// --- Play restart-from-0 behavior (Requirement 10) ---
+
+test('Play restarts from 0 when the authoritative position is already at the natural end of the track', () => {
+  const room = roomManager.createRoom('sock-18', 'Host');
+  roomManager.setTrack(room.code, makeTrackMeta());
+  roomManager.setReady('sock-18', room.track.version, 10); // short 10s track
+  // Simulate the room having already naturally completed: paused at duration.
+  room.playback = { status: 'paused', positionSec: 10, anchorServerTime: Date.now(), version: room.playback.version + 1, trackVersion: room.track.version };
+
+  const replayResult = roomManager.issuePlayCommand(room.code);
+  assert.equal(replayResult.room.playback.status, 'playing');
+  assert.equal(replayResult.room.playback.positionSec, 0, 'must restart from the beginning, not try to start at/past the track duration');
+  // Still uses the normal future-scheduled mechanism - unchanged lead behavior.
+  assert.ok(replayResult.targetServerTime > Date.now());
+});
+
+test('a prompt, normal Play from a mid-track position is NOT affected by the restart-from-0 logic', () => {
+  const room = roomManager.createRoom('sock-19', 'Host');
+  roomManager.setTrack(room.code, makeTrackMeta());
+  roomManager.setReady('sock-19', room.track.version, 180);
+  const seekResult = roomManager.issueSeekCommand(room.code, 42); // paused at 42s, well short of the 180s duration
+  assert.equal(seekResult.room.playback.status, 'paused');
+
+  const playResult = roomManager.issuePlayCommand(room.code);
+  assert.equal(playResult.room.playback.status, 'playing');
+  assert.equal(playResult.room.playback.positionSec, 42, 'a normal resume must start from where it was left, not be reset to 0');
+});

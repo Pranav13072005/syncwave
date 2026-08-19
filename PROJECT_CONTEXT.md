@@ -27,12 +27,27 @@ persistence). Current shape:
 {
   code, hostId,
   clients: Map<socketId, {id, name, rtt, clockOffsetMs, syncStatus, driftMs, driftCorrectionCount, joinedAt}>,
-  track: null | { version, originalName, mimeType, size, url, storedFilename, uploadedAt, durationSec? },
+  track: null | { trackId, version, originalName, mimeType, size, url, storedFilename, uploadedAt, durationSec? },
+  queue: [{ trackId, originalName, mimeType, size, url, storedFilename, uploadedAt, durationSec? }, ...],  // queue[0] is the immediate-next preload candidate
   readyDevices: Set<socketId>,  // devices that decoded `track` at its current version
+  nextReadyDevices: Set<socketId>,  // devices that decoded queue[0] at its current trackId
   playback: { status: 'playing'|'paused', positionSec, anchorServerTime, version, trackVersion },
   emptyingTimer: Timeout | null,  // Phase 6: set while the room is empty and mid-grace-period
+  playbackEndTimer: Timeout | null,  // set while playing with a known duration - fires natural completion (or, Phase 6.2A, a queue advance)
+  trackIdCounter: number,  // Phase 6.2A: assigns each uploaded file (current or queued) a stable identity, separate from track.version
 }
 ```
+`trackId` (Phase 6.2A) vs. `track.version`: these answer two different questions and are
+deliberately NOT unified into one counter. `track.version` is "how many times has the
+CURRENT-track slot been replaced" - it's what `playback.trackVersion` ties to, and what the
+existing `readyDevices` staleness check (`track:ready`) is keyed on; it intentionally bumps
+every time a track becomes current, including when a queued track advances into that slot.
+`trackId` is "which physical uploaded file is this" - a per-room monotonic counter assigned
+once at upload time (whether the file becomes current immediately or is queued) that stays
+unchanged as that same file later moves from `queue` into `track`. It exists specifically so
+next-track preload readiness (`nextReadyDevices`, `queue:trackReady`) can be validated against
+"is this a report for queue[0], right now" without a new parallel version-counter family - see
+"Queue + preload + synchronized transitions" below.
 `isHost` is NOT stored per-client (Phase 6 removed it from the client record) -
 it's computed in `toPublicState()` as `c.id === room.hostId`, so host
 reassignment can never leave a stale flag on some other client. `joinedAt`
@@ -91,6 +106,14 @@ Phase 5 drift events (`server/driftHandlers.js`, `client/src/driftMonitor.js` + 
 
 Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as noted above; the new mechanism lives in `client/src/recoveryState.js`, `server/roomManager.js`'s promotion/cleanup logic, and `server/uploadRoute.js`'s host re-check):
 - `POST /api/upload` gained one more rejection: after consuming the token, the route re-checks that the token's `socketId` is *still* the room's current `hostId` (not just at token-issue time). A former host's already-issued-but-unused token now fails with the same `403 INVALID_TOKEN` once host ownership has changed.
+
+Phase 6.2A queue events (`server/queueHandlers.js`, `client/src/components/QueuePanel.jsx` + `Room.jsx`'s preload effect):
+- `POST /api/upload` behavior change: the SAME upload/token flow now branches on whether the room already has a current track. No current track -> the upload becomes current (unchanged from Phase 2). A current track already exists -> the upload is appended to `room.queue` instead of replacing it - **uploads no longer replace a track that's already playing.** Response now also includes `queuedTrack` when that branch is taken. There is deliberately no separate `queue:add` socket event - adding to the queue reuses the exact same upload-token/host-authorization mechanism as any other upload, just routed to a different destination slot server-side.
+- `queue:remove` (client→server, ack) - `{ trackId }` in. Host-only. Removes a queued track by its stable `trackId`; ack `{ ok: false, error: 'NOT_HOST' | 'NO_ROOM' | 'TRACK_NOT_FOUND' }` on rejection. Never touches `room.track` (a current track isn't in `room.queue`, so it can't be targeted this way). The removed file is deleted from disk once no longer referenced.
+- `queue:reorder` (client→server, ack) - `{ trackId, toIndex }` in. Host-only. Moves a queued track to `toIndex` (clamped into range rather than rejected). Never touches current track/playback state.
+- `queue:next` (client→server, ack) - no payload. Host-only. Rejects `QUEUE_EMPTY` (current playback left completely undisturbed) if nothing is queued; otherwise atomically shifts `queue[0]` into `room.track` and starts it playing from `positionSec: 0` at a future `anchorServerTime` - the same `PLAYBACK_SCHEDULE_LEAD_MS` (1000ms) lead every other playback command uses, not a new constant.
+- `queue:trackReady` (client→server, ack) - `{ trackId, durationSec }` in; only accepted if `trackId` matches `queue[0]` EXACTLY right now (a report for any other track - stale after a reorder/removal/advance - is silently ignored, mirroring `track:ready`'s version check). On success, adds the socket to `nextReadyDevices` and stores `durationSec` on the queue item so it carries forward into `room.track.durationSec` (arming the end timer immediately) if/when this track becomes current before a fresh `track:ready` arrives.
+- All four broadcast the updated state via the existing `room:update` (not a new event), same as every other room-state change since Phase 1. `toPublicState` now also includes `queue`, and each client entry gains `isNextReady` (mirrors the existing `isReady`).
 
 ## Synchronization algorithm (current state)
 - Clock offset (Phase 3, `client/src/clockSync.js`): 9 sequential Cristian's-
@@ -258,6 +281,61 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
   upload tokens are purged (`uploadTokens.purgeRoom`), and a registered
   `onRoomDeleted` listener fires so `server/index.js` can delete the track
   file - `roomManager.js` itself has no filesystem knowledge.
+- Canonical-position clamping + natural completion (bugfix round after
+  Phase 6, `server/roomManager.js` + `client/src/driftMonitor.js`): every
+  canonical/expected-position calculation is clamped to `[0, durationSec]`
+  once duration is known - `getCanonicalPosition` (server) reads
+  `room.track?.durationSec` directly; `computeExpectedPositionSec` (client)
+  takes an optional 3rd `durationSec` param and is THE single helper reused
+  by recovery (`computeScheduledPlayingState`), drift measurement/correction,
+  and the `PlaybackControls` display (which used to duplicate the formula -
+  now calls the shared helper instead, closing that duplication too).
+  - Server-side end timer: `scheduleEndTimer(room)` computes
+    `remainingSec = durationSec - positionSec`,
+    `endServerTime = anchorServerTime + remainingSec * 1000`, and sets a
+    `.unref()`'d timeout capturing the playback version and track version it
+    was scheduled for. On fire, it re-checks room identity + both versions +
+    status before calling `completeNaturalPlayback` (→ `status: 'paused'`,
+    `positionSec: durationSec`, version bump, broadcast via a new
+    `onPlaybackCompleted` listener - mirrors `onRoomDeleted`'s pattern so
+    `roomManager.js` still never touches `io`). Any intervening command
+    (all of which bump `playback.version`) makes a stale timer a safe no-op.
+  - Scheduled/cancelled on: `issuePlayCommand` (schedules),
+    `issuePauseCommand` (cancels), `issueSeekCommand` (reschedules if still
+    playing, else cancels), `setTrack` (cancels - old track's timer must
+    never fire for the new one), `setReady` (schedules retroactively if
+    duration just became known *while already playing* - covers a host
+    pressing Play before their own device finishes decoding), and final
+    room deletion (cancels, preventing a leak - NOT at the start of the
+    empty-room grace period, since playback state is otherwise preserved
+    during that window and the stale-version check makes an active timer
+    harmless if someone rejoins).
+  - No new `'ended'` status was introduced - natural completion is just a
+    normal `paused` state at `positionSec === durationSec`. This means late
+    join/reconnect-after-completion needed ZERO new client code: the
+    existing paused-state path (no `schedulePlay` call) and the existing
+    `canMeasureDrift` paused-gate (drift measurement/correction already
+    stops) both already do the right thing once completion is "just a
+    pause" - the entire fix is about correctly *reaching* that state and
+    clamping the numbers along the way, not new state-machine branches.
+  - Play restart-from-0 (Requirement 10): `issuePlayCommand` checks
+    `positionSec >= durationSec - COMPLETION_EPSILON_SEC` (epsilon 50ms, for
+    floating-point safety) using the canonical position it already computes,
+    and resets to 0 before constructing the normal future-scheduled command -
+    no special scheduling path, so all devices still restart together via
+    the existing mechanism.
+  - Client `onended` (`playbackEngine.js`): `schedulePlay`'s source now sets
+    `onended` to clear `currentSource`/`currentAnchor`, but ONLY if that
+    exact source is still the current one - `.stop()` is also called
+    intentionally for pause/seek/drift-correction/recovery, which fires
+    `onended` too, so an unguarded handler would risk clobbering a newer
+    source's state if the old node's `onended` fires after a replacement was
+    already scheduled. Purely local cleanup - never emits a socket event
+    (the server's own end timer, not this event, decides natural completion
+    for the room) - closes the brief gap between the local node naturally
+    stopping and the server's completion broadcast arriving, during which
+    `getActualPositionSec()` would otherwise keep extrapolating past the
+    real (stopped) position.
 
 ## Important decisions
 - Phase 0 PoC lives under `server/public` as plain HTML/JS (no React yet) so
@@ -456,6 +534,33 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
   trigger for the identical action; Socket.IO's own `disconnect` already
   fires the correct sequence and remains what actually resets recovery
   prerequisites - the offline handler doesn't duplicate or race that.
+- Phase 6.2A: re-uploading while a current track exists now queues instead of
+  replacing. This is a deliberate behavior change from Phase 2 (where a
+  second upload always replaced the current track) - now that a queue
+  exists, "replace what's playing" is superseded by "queue it, then Next"
+  (or let it play out and auto-advance), which is a strictly more useful
+  default once there's somewhere else for the file to go. No existing test
+  depended on the old replace-on-reupload behavior (confirmed by inspection -
+  every existing upload test only uploads once per room); `roomManager.setTrack`
+  itself is untouched and still directly available/tested for "replace current
+  track" as a primitive, it's only `uploadRoute.js`'s routing decision that
+  changed.
+- `queue:next` always results in `status: 'playing'` on the new track, even if
+  the room was paused beforehand - Next is inherently a "skip to and play the
+  next track" action (matching the common queue-UX expectation, e.g.
+  Spotify's skip), not a "replace current track but preserve paused/playing
+  state" operation. Consistent with the automatic-advance case, which must
+  always end up playing (a track just finished playing).
+- `trackId` (see Room-state model above) was added as a minimal, single-purpose
+  per-file identity rather than a second monotonic "version" family - it answers
+  "is this a preload report for the CURRENT queue[0]" and nothing else.
+  `track.version` and `playback.version` needed no changes at all for queue
+  reorder/advance/preload-readiness: a queue advance is just another track
+  replacement (reuses `track.version`) plus another authoritative state change
+  (reuses `playback.version`), and queue-only mutations (add/remove/reorder
+  that don't touch `queue[0]`) don't bump either since they don't touch
+  current track/playback state - see "Queue + preload + synchronized
+  transitions" above.
 
 ## Completed features
 - Phase 0: Socket.IO connection between server and multiple clients; shared
@@ -571,6 +676,68 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
   a participant disconnect, reconnect resumes from the authoritative CURRENT
   position after the host changed it mid-disconnect) - 103 scripted tests
   total across the whole project, all passing.
+- Phase 6.1 bugfix round (playback-lifecycle correctness): real-device
+  testing found the timeline kept advancing past a track's natural end
+  (audio stopped locally, but authoritative state/UI kept extrapolating
+  forever). Fixed: canonical/expected-position calculations are now clamped
+  to `[0, durationSec]` everywhere they're computed (server
+  `getCanonicalPosition`, client `computeExpectedPositionSec` - now the
+  single shared helper, deduping what used to be a separate formula in
+  `PlaybackControls`); a new server-side `.unref()`'d end timer
+  (`server/roomManager.js`) transitions authoritative playback to `paused`
+  at `positionSec === durationSec` when a track naturally finishes, protected
+  against stale firing by re-checking room/playback-version/track-version
+  identity, and (re)scheduled/cancelled on every play/pause/seek/track-
+  replacement/room-deletion; completion broadcasts via a new
+  `onPlaybackCompleted` listener (mirrors `onRoomDeleted`); Play after
+  natural completion restarts from 0 (epsilon-based "already at the end"
+  check) using the same future-scheduled mechanism; `playbackEngine.js`
+  gained a guarded `onended` handler for local-only anchor cleanup (never
+  emits, never touches authoritative state). No new `'ended'` status -
+  late-join/reconnect-after-completion and drift-stopping needed zero new
+  client code since completion is just a normal paused state. 18 new
+  scripted tests (12 server: clamp boundary/never-exceeds, natural
+  completion → paused/duration/version-bump, stale-timer protection after
+  Pause/Seek/track-replacement, Seek-while-playing reschedules correctly,
+  room-deletion clears the timer, completion broadcast, Play restarts from
+  0, prompt Play unaffected; 6 client: clamp boundary/never-exceeds/
+  uncapped-without-duration, drift monitor inert after completion, late
+  join and reconnect after completion both remain paused with no schedule
+  instruction) - 121 scripted tests total across the whole project, all
+  passing.
+- Phase 6.2A: server-authoritative song queue, next-track preloading,
+  host-controlled Next, and synchronized automatic transition between
+  tracks. `room.queue[]` (each item with a stable `trackId`, separate from
+  `track.version`); a second upload now appends to the queue instead of
+  replacing the current track (`server/uploadRoute.js` routes on whether a
+  current track already exists); host-only `queue:remove`/`queue:reorder`/
+  `queue:next` (`server/queueHandlers.js`, reusing a `requireHost` extracted
+  to `server/socketUtils.js` from `playbackHandlers.js`); manual Next and
+  automatic advance (queue non-empty at natural completion) share one
+  `advanceToNextTrack` function, reusing the exact Phase 6.1 end-timer
+  architecture (stale-timer protection via the existing version-capture-and-
+  recheck, no new counters) so the completion chain can flow through an
+  arbitrarily long queue; client preloads ONLY the immediate-next track into
+  a second buffer ref and promotes it (no re-download) when it becomes
+  current, via the exact same identity-match discipline the server's
+  `setNextReady` uses; a track advance needed zero new client scheduling
+  code since it reuses the Phase 6 recovery/apply effect verbatim; a slow/
+  unready device stays silent and recovers automatically once decoded (same
+  `trackDecoded` prerequisite gate, no special-cased policy); file cleanup
+  extended to the queue (`server/index.js`'s `onRoomDeleted`/
+  `onPlaybackCompleted` listeners, plus direct cleanup in `queueHandlers.js`/
+  `uploadRoute.js` for handler-triggered mutations). New `QueuePanel.jsx` UI
+  (NOW PLAYING via `TrackPanel`, UP NEXT list, host-only Add/Remove/Move/
+  Next, compact "next track ready: X/Y devices" readout). 32 new scripted
+  server tests (22 direct roomManager unit tests covering add/remove/
+  reorder, preload-readiness identity/staleness, manual Next including
+  QUEUE_EMPTY and version-consistency, queue-only mutations leaving current
+  playback untouched, natural-completion-with-a-queue advance, stale-timer
+  protection across an advance, and late-join/reconnect-mid-transition state
+  shape; 10 live-server integration tests covering upload routing, queue
+  mutation/readiness/transition broadcasts, host-only rejection, and on-disk
+  file cleanup) - 153 scripted tests total across the whole project, all
+  passing.
 
 ## Known issues
 - The real app's clock-offset estimate (Phase 3) is robust (9-sample,
@@ -631,3 +798,102 @@ Phase 6 recovery (no new socket events - reuses `room:join`/`room:update` as not
   (`server/test/disconnectRecovery.test.js`), and the client-side pure
   position-calculation fix (`recoveryState.unit.test.mjs`). The actual local
   audio stop must be confirmed by ear/eye per the manual verification steps.
+- Same limitation applies to the new `onended` handler
+  (`playbackEngine.js`): its guard logic (only clean up if still the current
+  source) can't be exercised under Node (`getAudioContext()` needs
+  `window`), so it's verified by code inspection and manual browser testing
+  (Test A's "no further drift correction" step), not a scripted test. What
+  IS scripted-test-covered is everything server-side (the actual authority
+  for natural completion) and the client-side pure position/clamp math.
+- The server's end timer fires based on absolute server wall-clock time
+  (`endServerTime`); each client's local audio was independently scheduled
+  to stop at that same server instant via its own Phase 3 clock-offset
+  estimate. Any residual mismatch between "local audio actually stops" and
+  "server broadcasts completion" is bounded by that client's normal
+  clock-sync accuracy - not a new source of imprecision introduced by this
+  fix, just the same tolerance that already governs regular play/pause/seek.
+- Track-to-track transitions (Phase 6.2A) are NOT sample-perfect gapless -
+  every transition (manual Next or automatic advance) goes through the same
+  ~1000ms future-scheduling lead every other playback command uses, so
+  there's a short, deliberate, server-broadcast gap between tracks rather
+  than zero-gap playback. Explicitly out of scope per the brief
+  ("correct synchronization is more important than zero-gap playback").
+- Client-side next-track preload only ever holds ONE buffer ahead
+  (`queue[0]`), by design (bounded memory use per the spec) - queue items
+  beyond the immediate next are not fetched/decoded until they themselves
+  become `queue[0]`, so a transition two-or-more tracks deep into the queue
+  always incurs a fresh download for that track, same as any first-time
+  current-track decode.
+- Room-deletion file cleanup (both the current track and every queued file)
+  is verified in-process at the `roomManager.js` level - the deleted room
+  object retains its full `track`/`queue` with `storedFilename`s intact at
+  the moment `onRoomDeleted` fires (`server/test/queueManager.test.js`).
+  It is NOT verified end-to-end against the live server with real
+  `fs.existsSync` checks, because `setRoomCleanupGraceMsForTesting` only
+  overrides the roomManager module instance inside the TEST process, not the
+  one running inside the separate `node index.js` server process - there is
+  no way to force the live server's real ~30s grace period to expire quickly
+  without actually waiting it out. `index.js`'s actual `fs.unlink` loop
+  consuming that room-deletion data is a direct, trivially-inspectable
+  few-line consequence of it (the same trust boundary the original Phase 6
+  onRoomDeleted current-track-only cleanup was never fs-tested end-to-end
+  under either, for the same reason). Manual Next's and natural-completion's
+  file cleanup (which run inside a live request/timer, not behind the grace
+  period) ARE verified end-to-end with real `fs.existsSync` checks.
+- The "X/Y devices" next-track-ready readout (`QueuePanel.jsx`) only counts
+  devices that have both enabled audio and finished decoding `queue[0]` -
+  same convention as the existing current-track READY badge (a device that
+  hasn't clicked "Enable Audio" yet never counts as ready for anything).
+- Queue + preload + synchronized transitions (Phase 6.2A, `server/roomManager.js`'s
+  `addToQueue`/`removeFromQueue`/`reorderQueue`/`setNextReady`/`advanceToNextTrack`/
+  `issueNextCommand`, `client/src/components/Room.jsx`'s next-track preload effect):
+  - A manual Next and an automatic advance (queue non-empty at natural completion)
+    are the SAME operation, `advanceToNextTrack`: cancel the old track's end timer,
+    shift `queue[0]` into `room.track` (a track replacement exactly like `setTrack` -
+    bumps `track.version`, clears `readyDevices`), start it playing from `positionSec: 0`
+    at `Date.now() + PLAYBACK_SCHEDULE_LEAD_MS`, then call `scheduleEndTimer` again for
+    the new track. Reusing the *same* 1000ms lead every other playback command uses
+    (rather than a separate "transition" lead) means a track-to-track transition
+    involves a short broadcast-scheduling gap rather than sample-perfect gapless
+    playback - deliberately out of scope per the brief ("a short controlled transition
+    is acceptable; correct synchronization is more important than zero-gap playback").
+  - `completeNaturalPlayback` (the Phase 6.1 end-timer callback) now branches on
+    `room.queue.length`: empty -> the unchanged Phase 6.1 behavior (pause at
+    `positionSec === durationSec`); non-empty -> one `advanceToNextTrack` call, so a
+    queued room never broadcasts a permanent paused-at-end state before flowing into
+    the next track. Because `advanceToNextTrack` itself calls `scheduleEndTimer` again,
+    the completion chain advances through an arbitrarily long queue with zero extra
+    bookkeeping - each track's end timer simply schedules the next one.
+  - Stale-timer/stale-track protection is entirely the *existing* Phase 6.1 mechanism,
+    unmodified: `scheduleEndTimer` still captures `playback.version`/`track.version` in
+    its closure and re-validates both (plus room identity and `status === 'playing'`)
+    when it fires. A track that already advanced via manual Next bumped both versions,
+    so the OLD track's stale timer (if it was still pending) is automatically a no-op -
+    no queue-specific version check was needed.
+  - Client-side, a track advance requires ZERO new scheduling code: `advanceToNextTrack`
+    produces an ordinary `{track, playback}` update shape (same as any track replacement
+    + immediate play), so the *existing* Phase 6 recovery/apply effect in `Room.jsx`
+    (`tryConsumePending` + `schedulePlay`) handles it automatically once `decodedVersion`
+    matches the new `track.version`. This is also why "an unready device stays silent and
+    recovers once decoded" (the spec's required MVP policy for a slow next-track
+    preload) needed no new code either - it's exactly the existing `trackDecoded`
+    prerequisite gate, which already keeps `toApply` `null` until decode catches up, at
+    which point `computeExpectedPositionSec` naturally computes the real elapsed
+    position into the new track rather than 0.
+  - Client-side preload (`Room.jsx`): a SEPARATE `useEffect`, declared after the
+    current-track decode effect (current-track recovery takes priority per the spec),
+    decodes ONLY `state.queue?.[0]` into a second ref (`nextBufferRef`, distinct from
+    `bufferRef`) and reports `queue:trackReady`. When that same track later becomes
+    current, the current-track decode effect checks `nextBufferRef.current.trackId`
+    first and PROMOTES the already-decoded buffer (no re-download/re-decode) if it
+    matches exactly - the same identity-match discipline the server applies to
+    `setNextReady`. A preload failure is non-fatal (logged, not surfaced as a blocking
+    UI error) - the device just falls back to a normal decode once the track actually
+    becomes current, same recovery path as any late-decoding device.
+  - Next-track readiness (`nextReadyDevices`) is informational only - `issueNextCommand`
+    never checks it before transitioning (the spec's deterministic MVP policy: the
+    server always transitions authoritatively regardless of per-device readiness). It's
+    cleared whenever `queue[0]`'s `trackId` identity changes (add-to-empty-queue,
+    remove-of-queue[0], a reorder that changes the front, or an advance) and left alone
+    otherwise (e.g. appending to the back of a non-empty queue), reusing the exact
+    Set-based staleness pattern `readyDevices`/`track:ready` already established.

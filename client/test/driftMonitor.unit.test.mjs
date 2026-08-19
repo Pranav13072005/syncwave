@@ -29,6 +29,25 @@ test('computeExpectedPositionSec clamps to the anchor position for a time before
   assert.equal(computeExpectedPositionSec(playback, 4000), 5);
 });
 
+// --- natural-completion clamping (the late-completion bug fix) ---
+
+test('computeExpectedPositionSec clamps exactly at duration once elapsed time would carry it past the end', () => {
+  // 178s in, 3s later would naturally be 181s - must clamp to the 180s duration exactly.
+  const playback = { status: 'playing', positionSec: 178, anchorServerTime: 0, trackVersion: 1 };
+  assert.equal(computeExpectedPositionSec(playback, 3000, 180), 180);
+});
+
+test('computeExpectedPositionSec never exceeds duration no matter how far past the end "now" is', () => {
+  const playback = { status: 'playing', positionSec: 0, anchorServerTime: 0, trackVersion: 1 };
+  assert.equal(computeExpectedPositionSec(playback, 999_999_999, 180), 180);
+});
+
+test('computeExpectedPositionSec applies no clamp when durationSec is omitted (existing 2-arg callers unaffected)', () => {
+  const playback = { status: 'playing', positionSec: 178, anchorServerTime: 0, trackVersion: 1 };
+  const pos = computeExpectedPositionSec(playback, 5000); // 5s elapsed, well past any real "180s track" duration
+  assert.ok(Math.abs(pos - 183) < 0.001, `expected ~183 (uncapped), got ${pos}`);
+});
+
 // --- computeDriftMs (zero / ahead / behind) ---
 
 test('computeDriftMs is zero when actual matches expected exactly', () => {
@@ -77,6 +96,18 @@ test('canMeasureDrift is false when the device has no completed clock sync', () 
 test('canMeasureDrift defaults hasClockSync to true, so pre-Phase-6 call sites are unaffected', () => {
   const playback = { status: 'playing', trackVersion: 1 };
   assert.equal(canMeasureDrift(playback, 1), true); // 2-arg call, same as all existing Phase 5 tests
+});
+
+// --- drift monitor does nothing after natural completion ---
+// Natural completion (Phase 6.1) transitions authoritative playback to a
+// normal 'paused' state at the track duration - there is no separate
+// "ended" status. So the SAME paused-state gate that already stops drift
+// measurement/correction applies here with no new code: once the completion
+// broadcast arrives, playback.status is 'paused' and canMeasureDrift is
+// false, exactly as it would be for any other pause.
+test('canMeasureDrift is false once natural completion has set authoritative status to paused', () => {
+  const completedPlayback = { status: 'paused', positionSec: 180, trackVersion: 1 }; // as produced by server-side natural completion
+  assert.equal(canMeasureDrift(completedPlayback, 1, true), false);
 });
 
 test('canMeasureDrift requires ALL three conditions - playing, matching track, and synced', () => {

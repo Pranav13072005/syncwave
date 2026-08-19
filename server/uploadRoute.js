@@ -70,27 +70,38 @@ function createUploadRouter(io) {
         return;
       }
 
-      const result = roomManager.setTrack(consumed.roomCode, {
+      const meta = {
         originalName: req.file.originalname,
         mimeType: req.file.mimetype,
         size: req.file.size,
         storedFilename: req.file.filename,
         url: `/uploads/${req.file.filename}`,
         uploadedAt: Date.now(),
-      });
+      };
 
-      if (!result) {
+      // Re-fetch room state right here (not the `currentRoom` snapshot taken
+      // before the multer disk write, which is async and could race a second
+      // upload) to decide the destination: no current track yet -> this
+      // upload becomes current (Phase 2 behavior, unchanged); a current
+      // track already exists -> append to the queue instead (Phase 6.2A) -
+      // uploads no longer replace a track that's already playing.
+      const roomNow = roomManager.getRoom(consumed.roomCode);
+      if (!roomNow) {
         fs.unlink(req.file.path, () => {});
         res.status(404).json({ error: 'ROOM_NOT_FOUND' });
         return;
       }
+
+      const result = roomNow.track
+        ? roomManager.addToQueue(consumed.roomCode, meta)
+        : roomManager.setTrack(consumed.roomCode, meta);
 
       if (result.previousTrack?.storedFilename) {
         fs.unlink(path.join(UPLOAD_DIR, result.previousTrack.storedFilename), () => {});
       }
 
       io.to(consumed.roomCode).emit('room:update', roomManager.toPublicState(result.room));
-      res.json({ ok: true, track: result.room.track });
+      res.json({ ok: true, track: result.room.track, queuedTrack: result.queuedTrack });
     });
   });
 

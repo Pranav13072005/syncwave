@@ -12,15 +12,23 @@ const registerTrackHandlers = require('./trackHandlers');
 const registerClockHandlers = require('./clockHandlers');
 const registerPlaybackHandlers = require('./playbackHandlers');
 const registerDriftHandlers = require('./driftHandlers');
+const registerQueueHandlers = require('./queueHandlers');
 const roomManager = require('./roomManager');
 const { createUploadRouter, UPLOAD_DIR } = require('./uploadRoute');
 
 // Phase 6: when a room is finally deleted (its empty-room grace period
 // expired), delete its uploaded track file too - roomManager.js itself
-// deliberately has no filesystem knowledge.
+// deliberately has no filesystem knowledge. Phase 6.2A: also delete every
+// queued file - a deleted room must not leak any file it was still holding
+// a reference to, current or queued.
 roomManager.onRoomDeleted((room) => {
   if (room.track?.storedFilename) {
     fs.unlink(path.join(UPLOAD_DIR, room.track.storedFilename), () => {});
+  }
+  for (const queuedTrack of room.queue) {
+    if (queuedTrack.storedFilename) {
+      fs.unlink(path.join(UPLOAD_DIR, queuedTrack.storedFilename), () => {});
+    }
   }
 });
 
@@ -35,6 +43,20 @@ const server = http.createServer(app);
 const io = new Server(server);
 app.use('/api', createUploadRouter(io));
 
+// When a track naturally reaches its duration, roomManager.js's server-side
+// end timer either pauses at the track's end (empty queue, Phase 6.1) or
+// advances to the next queued track (Phase 6.2A) and calls this listener to
+// broadcast the result - roomManager.js has no `io`/filesystem access
+// itself. On an advance, the superseded track's file is cleaned up here too
+// (mirrors uploadRoute.js's replace-track cleanup, just triggered internally
+// by the timer instead of a new upload).
+roomManager.onPlaybackCompleted((room, info) => {
+  if (info?.previousTrack?.storedFilename) {
+    fs.unlink(path.join(UPLOAD_DIR, info.previousTrack.storedFilename), () => {});
+  }
+  io.to(room.code).emit('room:update', roomManager.toPublicState(room));
+});
+
 io.on('connection', (socket) => {
   console.log(`[connect] ${socket.id} (${io.engine.clientsCount} connected)`);
 
@@ -43,6 +65,7 @@ io.on('connection', (socket) => {
   registerClockHandlers(io, socket);
   registerPlaybackHandlers(io, socket);
   registerDriftHandlers(io, socket);
+  registerQueueHandlers(io, socket);
 
   // Single-sample Cristian's-algorithm style clock offset probe.
   // Phase 3 replaces this with an 8-10 sample, low-RTT/median robust estimate.

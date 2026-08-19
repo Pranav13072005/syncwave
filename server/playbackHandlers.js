@@ -3,15 +3,7 @@
 // lives in roomManager.js - this file only enforces "who is allowed to ask"
 // (host-only) and broadcasts the result via the existing room:update.
 const roomManager = require('./roomManager');
-const { getSocketRoomCode } = require('./socketUtils');
-
-function requireHost(socket) {
-  const roomCode = getSocketRoomCode(socket);
-  const room = roomCode ? roomManager.getRoom(roomCode) : null;
-  if (!room) return { error: 'NO_ROOM' };
-  if (room.hostId !== socket.id) return { error: 'NOT_HOST' };
-  return { room };
-}
+const { requireHost } = require('./socketUtils');
 
 function registerPlaybackHandlers(io, socket) {
   socket.on('playback:play', (_payload, ack) => {

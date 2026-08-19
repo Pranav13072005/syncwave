@@ -102,16 +102,52 @@
   passing. The actual local-audio-stop-on-disconnect behavior itself can only
   be verified in a real browser (no `window`/AudioContext under Node, same
   limitation as all Web-Audio-touching code since Phase 0).
+- Phase 6.1 bugfix round (playback lifecycle): real-device testing found the
+  authoritative timeline/UI kept advancing past a track's natural end even
+  though the local audio had already stopped. Fixed: canonical/expected-
+  position calculations are now clamped to `[0, durationSec]` everywhere
+  (server `getCanonicalPosition`; client `computeExpectedPositionSec`, now
+  the one shared helper - also deduped `PlaybackControls`'s previously
+  separate display formula into it); a new server-side end timer
+  (`server/roomManager.js`) transitions authoritative playback to `paused`
+  at exactly `durationSec` when a track naturally finishes, protected
+  against stale firing by room/playback-version/track-version checks, and
+  (re)scheduled or cancelled on every Play/Pause/Seek/track-replacement/
+  room-deletion; broadcasts via a new `onPlaybackCompleted` listener
+  (mirrors `onRoomDeleted`); Play after completion restarts from 0 using the
+  same future-scheduled mechanism; `playbackEngine.js` gained a guarded
+  `onended` for local-only cleanup (never emits, never touches authoritative
+  state). No new `'ended'` status - late-join/reconnect-after-completion and
+  drift-stopping needed zero new client code since completion is just a
+  normal paused state. 18 new scripted tests (12 server, 6 client) - 121
+  scripted tests total across the whole project, all passing.
+- Phase 6.2A: server-authoritative song queue, next-track preloading,
+  host-controlled Next, and synchronized automatic transition between
+  tracks. `room.queue[]` with a stable per-file `trackId` (separate from the
+  existing `track.version`); a second upload now queues instead of
+  replacing the current track; host-only `queue:remove`/`queue:reorder`/
+  `queue:next`; manual Next and automatic advance (queue non-empty at
+  natural completion) share one function that reuses the Phase 6.1 end-timer
+  architecture as-is (no new stale-protection mechanism needed); client
+  preloads only `queue[0]` into a second buffer and promotes it (no
+  re-download) when it becomes current, via the existing Phase 6 recovery/
+  apply path with zero new client scheduling code; an unready device stays
+  silent and recovers automatically once decoded; queue-only mutations
+  (add/remove/reorder not touching `queue[0]`) never disturb current
+  playback; file cleanup extended to cover queued files. New `QueuePanel`
+  UI (Up Next list, host Add/Remove/Move/Next controls, compact next-ready
+  readout). 32 new scripted server tests (22 direct roomManager unit tests +
+  10 live-server integration tests) - 153 scripted tests total across the
+  whole project, all passing.
 
 ## CURRENT
-- Awaiting a second round of real laptop/phone verification confirming both
-  fixes hold (see checklist in chat: late join mid-playback stays silent
-  then starts directly at the correct elapsed position with no audible
-  jump/correction; killing Wi-Fi on a playing device stops its audio
-  immediately without pausing other devices; reconnecting resumes from the
-  room's current position, including if the host changed something while
-  the device was offline), then start Phase 7: benchmarks, automated tests,
-  error handling, README, UI polish.
+- Awaiting real laptop/phone verification of the Phase 6.2A queue (see
+  checklist in chat: Test A queue basic, Test B preload, Test C manual Next,
+  Test D auto Next, Test E slow next-track client, Test F reorder, Test G
+  late join with a queue), alongside the still-pending Phase 6.1
+  playback-lifecycle checklist (Tests A-D: natural completion, seek near the
+  end, replay, late join after completion). Do not start the song queue's
+  remaining polish or Phase 7 until these are confirmed.
 
 ## NEXT
 - Phase 7: Benchmarks, automated tests, error handling, README, UI polish.

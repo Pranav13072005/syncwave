@@ -15,6 +15,7 @@ import {
 } from '../driftMonitor';
 import DeviceList from './DeviceList';
 import TrackPanel from './TrackPanel';
+import QueuePanel from './QueuePanel';
 import Diagnostics from './Diagnostics';
 import PlaybackControls from './PlaybackControls';
 
@@ -46,6 +47,7 @@ export default function Room({ initialState, onLeave }) {
   const [clockSynced, setClockSynced] = useState(getLastSyncStatus() === 'synced');
 
   const bufferRef = useRef({ version: null, buffer: null }); // decoded AudioBuffer for the current track version
+  const nextBufferRef = useRef({ trackId: null, buffer: null }); // decoded AudioBuffer for the immediate-next queued track (queue[0]), preloaded ahead of time
   const recoveryStateRef = useRef(createInitialRecoveryState());
   const driftStateRef = useRef(createInitialDriftState()); // consecutiveViolations/cooldown - reset whenever a new authoritative command arrives
   const driftTrackVersionRef = useRef(null); // which track the correction count is scoped to
@@ -165,8 +167,25 @@ export default function Room({ initialState, onLeave }) {
   useEffect(() => {
     if (!audioEnabled || !state.track) return;
     const targetVersion = state.track.version;
+    const targetTrackId = state.track.trackId;
     let cancelled = false;
     setDecodeError(null);
+
+    // This exact file may already have been decoded ahead of time as the
+    // queue's next-track preload candidate (see the preload effect below) -
+    // if so, promote it instead of re-downloading/re-decoding what's already
+    // sitting in memory. Only trusted when the trackId matches EXACTLY (the
+    // same stale-identity protection the server applies to next-track
+    // readiness reports) - a mismatch just falls through to a normal decode.
+    if (nextBufferRef.current.trackId === targetTrackId && nextBufferRef.current.buffer) {
+      const promotedBuffer = nextBufferRef.current.buffer;
+      bufferRef.current = { version: targetVersion, buffer: promotedBuffer };
+      nextBufferRef.current = { trackId: null, buffer: null };
+      setDecodedVersion(targetVersion);
+      setDecodeStatus('ready');
+      socket.emit('track:ready', { version: targetVersion, durationSec: promotedBuffer.duration });
+      return;
+    }
 
     decodeTrackFromUrl(state.track.url, { onStatus: (s) => !cancelled && setDecodeStatus(s) })
       .then((buffer) => {
@@ -186,6 +205,39 @@ export default function Room({ initialState, onLeave }) {
       cancelled = true;
     };
   }, [audioEnabled, state.track?.version, state.track?.url, retryTick]);
+
+  // Preloads/decodes ONLY the immediate-next queued track (queue[0]), never
+  // the whole queue - keeps memory use bounded while still making the next
+  // transition fast. Independent of the recovery prerequisites (it's a
+  // background optimization, not something synchronized playback depends
+  // on) and declared after the current-track decode effect above so a
+  // slow/contended connection prioritizes downloading the CURRENT track
+  // first, per the spec's "current-track recovery must take priority over
+  // next-track preload". A preload failure is non-fatal - this device simply
+  // won't be next-ready and will fall back to the normal decode-then-recover
+  // path once the track actually becomes current (same as any late-decoding
+  // device - see requirement 10 in the Phase 6.2A brief).
+  useEffect(() => {
+    const nextTrack = state.queue?.[0] || null;
+    if (!audioEnabled || !nextTrack) return;
+    const targetTrackId = nextTrack.trackId;
+    if (nextBufferRef.current.trackId === targetTrackId) return; // already preloaded (or in flight) for this exact track
+    let cancelled = false;
+
+    decodeTrackFromUrl(nextTrack.url)
+      .then((buffer) => {
+        if (cancelled) return;
+        nextBufferRef.current = { trackId: targetTrackId, buffer };
+        socket.emit('queue:trackReady', { trackId: targetTrackId, durationSec: buffer.duration });
+      })
+      .catch((err) => {
+        console.warn(`Next-track preload failed for track ${targetTrackId}:`, err.message || err);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [audioEnabled, state.queue?.[0]?.trackId]);
 
   // Prerequisite-driven recovery apply: room joined + latest state received +
   // current track decoded + clock synchronized must ALL hold before anything
@@ -268,7 +320,8 @@ export default function Room({ initialState, onLeave }) {
 
       const offsetMs = getClockOffsetMs(); // non-null here: canMeasureDrift's clockSynced check already gated this
       const nowServerMs = Date.now() + offsetMs;
-      const expectedPositionSec = computeExpectedPositionSec(pb, nowServerMs);
+      const durationSec = state.track?.durationSec ?? null;
+      const expectedPositionSec = computeExpectedPositionSec(pb, nowServerMs, durationSec);
       const drift = computeDriftMs(actualPositionSec, expectedPositionSec);
       setDriftMs(drift);
 
@@ -280,7 +333,7 @@ export default function Room({ initialState, onLeave }) {
 
       if (nextState.didCorrect) {
         const correctionAnchorServerTime = nowServerMs + DEFAULT_CORRECTION_LEAD_MS;
-        const correctedPositionSec = computeExpectedPositionSec(pb, correctionAnchorServerTime);
+        const correctedPositionSec = computeExpectedPositionSec(pb, correctionAnchorServerTime, durationSec);
         schedulePlay(decoded.buffer, correctedPositionSec, correctionAnchorServerTime, offsetMs);
       }
     }, DEFAULT_MEASURE_INTERVAL_MS);
@@ -331,6 +384,8 @@ export default function Room({ initialState, onLeave }) {
       {isHost && <p className="host-tag">You are the host.</p>}
 
       <TrackPanel isHost={isHost} track={state.track} />
+
+      <QueuePanel isHost={isHost} queue={state.queue || []} clients={state.clients} />
 
       <div className="ready-panel">
         <h2>Audio</h2>

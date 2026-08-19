@@ -54,7 +54,7 @@ export default function TrackPanel({ isHost, track }) {
       <h2>Track</h2>
       {track ? (
         <p>
-          Current track: <strong>{track.originalName}</strong> ({(track.size / (1024 * 1024)).toFixed(1)} MB)
+          Now playing: <strong>{track.originalName}</strong> ({(track.size / (1024 * 1024)).toFixed(1)} MB)
         </p>
       ) : (
         <p>No track uploaded yet.</p>
@@ -62,7 +62,7 @@ export default function TrackPanel({ isHost, track }) {
 
       {isHost && (
         <label className={`upload-control${uploading ? ' disabled' : ''}`}>
-          {uploading ? 'Uploading…' : track ? 'Replace Track' : 'Upload Track'}
+          {uploading ? 'Uploading…' : track ? 'Add to Queue' : 'Upload Track'}
           <input
             type="file"
             accept=".mp3,.wav,audio/mpeg,audio/wav"
