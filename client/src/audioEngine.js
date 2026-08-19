@@ -2,7 +2,7 @@
 // explicit user gesture before audio can play, so the context is only
 // created/resumed from unlockAudioContext(), called from a click handler.
 let audioContext = null;
-
+//audiocontext = new (window.AudioContext || window.webkitAudioContext)();
 export function getAudioContext() {
   if (!audioContext) {
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
