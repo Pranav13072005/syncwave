@@ -49,7 +49,7 @@ export default function Landing({ onRoomJoined, initialRoomCode = '' }) {
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. Pranav's Laptop"
+          placeholder="e.g. Alex's Phone"
           maxLength={40}
         />
       </label>
